@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ambiente
+.env
+*.env
+
+# Modelos grandes
+*.onnx
+
+# Credenciais
+cloud-storage-cred.json
+firebase-cred.json
+
+# Build e cache
+temp/
+*.bak
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Exceções para VSCode
+!.vscode/extensions.json

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+pillow
+PyJWT
+firebase-admin
+onnxruntime
+faiss-cpu
+motor
