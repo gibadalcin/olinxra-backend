@@ -14,6 +14,7 @@ __pycache__/
 # Credenciais
 cloud-storage-cred.json
 firebase-cred.json
+clip_model.onnx
 
 # Build e cache
 temp/
