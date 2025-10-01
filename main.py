@@ -55,7 +55,7 @@ def initialize_firebase():
 
 def initialize_onnx_session():
     global ort_session
-    MODEL_PATH = "clip_model.onnx"  # Troque para o modelo não quantizado
+    MODEL_PATH = "quantized_clip_model.onnx"  # Troque para o modelo não quantizado
     try:
         ort_session = ort.InferenceSession(MODEL_PATH)
         logging.info("Sessão ONNX Runtime inicializada com sucesso.")
