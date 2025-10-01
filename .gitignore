@@ -15,6 +15,7 @@ __pycache__/
 
 # Credenciais
 cloud-storage-cred.json
+models-dowloader-cred.json
 firebase-cred.json
 clip_model.onnx
 
