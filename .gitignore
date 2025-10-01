@@ -1,3 +1,5 @@
+# Ignorar arquivos de modelo ONNX
+quantized_clip_model.onnx
 # Python
 __pycache__/
 *.pyc
