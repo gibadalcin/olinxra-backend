@@ -2,6 +2,7 @@ import requests
 import os
 import sys
 import socket
+import time  # <-- Adicione esta linha
 from requests.auth import HTTPDigestAuth
 from dotenv import load_dotenv
 
