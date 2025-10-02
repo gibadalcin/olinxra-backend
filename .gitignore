@@ -18,6 +18,7 @@ cloud-storage-cred.json
 models-downloader-cred.json
 firebase-cred.json
 clip_model.onnx
+test_mongo.py
 
 # Build e cache
 temp/
