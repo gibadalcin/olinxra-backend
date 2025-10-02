@@ -136,9 +136,9 @@ async def _search_and_compare_logic(file: UploadFile):
             temp_path = temp_file.name
         
         query_vector = extract_clip_features(temp_path, ort_session)
-        query_vector = np.array(query_vector, dtype=np.float32)
-        query_vector /= np.linalg.norm(query_vector)
-
+        import numpy as np
+        print("query_vector shape:", np.array(query_vector).shape)
+        print("faiss index dimension:", logo_index.index.d)
         results = logo_index.search(query_vector, top_k=1)
         
         if results:
