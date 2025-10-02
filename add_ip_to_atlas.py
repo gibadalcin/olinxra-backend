@@ -2,7 +2,6 @@ import requests
 import os
 import sys
 import socket
-import time
 from requests.auth import HTTPDigestAuth
 from dotenv import load_dotenv
 
@@ -14,7 +13,7 @@ ATLAS_PUBLIC_KEY = os.getenv('ATLAS_PUBLIC_KEY')
 ATLAS_PRIVATE_KEY = os.getenv('ATLAS_PRIVATE_KEY')
 ATLAS_PROJECT_ID = os.getenv('ATLAS_PROJECT_ID')
 FORCE_IP = os.getenv('FORCE_PUBLIC_IP')  # Permite sobrescrever o IP manualmente
-PROPAGATION_WAIT = int(os.getenv('ATLAS_PROPAGATION_WAIT', '30'))  # Tempo de espera para propagação (segundos)
+PROPAGATION_WAIT = int(os.getenv('ATLAS_PROPAGATION_WAIT', '3'))  # Tempo de espera para propagação (segundos)
 
 if not ATLAS_PUBLIC_KEY or not ATLAS_PRIVATE_KEY or not ATLAS_PROJECT_ID:
     print("[ERRO] Variáveis ATLAS_PUBLIC_KEY, ATLAS_PRIVATE_KEY ou ATLAS_PROJECT_ID não encontradas!")
@@ -26,7 +25,6 @@ def get_public_ip():
         'https://ifconfig.me/ip',
         'https://ipinfo.io/ip'
     ]
-    ips = set()
     for service in services:
         try:
             resp = requests.get(service, timeout=5)
@@ -34,20 +32,13 @@ def get_public_ip():
             ip = resp.text.strip()
             if ip:
                 print(f'IP público detectado via {service}: {ip}')
-                ips.add(ip)
+                return ip
         except Exception as e:
             print(f'[AVISO] Falha ao obter IP via {service}: {e}')
-    if not ips:
-        print('[ERRO] Não foi possível detectar o IP público.')
-        sys.exit(1)
-    # Retorna o IP mais comum entre os serviços (mitiga problemas de NAT/proxy)
-    return max(ips, key=lambda x: list(ips).count(x))
+    print('[ERRO] Não foi possível detectar o IP público.')
+    sys.exit(1)
 
-if FORCE_IP:
-    ip = FORCE_IP
-    print(f'IP público sobrescrito via ENV: {ip}')
-else:
-    ip = get_public_ip()
+ip = FORCE_IP if FORCE_IP else get_public_ip()
 
 # Exibe IP privado local para comparação
 try:
