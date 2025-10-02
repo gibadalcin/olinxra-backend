@@ -106,29 +106,6 @@ async def load_faiss_index():
         logging.error(f"Falha ao carregar o índice FAISS do MongoDB: {e}")
         raise HTTPException(status_code=500, detail="Falha ao inicializar o índice FAISS.")
 
-@app.on_event("startup")
-async def startup_event():
-    global client, db, logos_collection
-    MONGO_URI = os.getenv("MONGO_URI")
-    if not MONGO_URI:
-        raise RuntimeError("Variável de ambiente MONGO_URI não encontrada.")
-    DB_NAME = os.getenv("MONGO_DB_NAME", "olinxra")
-    
-    client = AsyncIOMotorClient(MONGO_URI)
-    db = client[DB_NAME]
-    logos_collection = db["logos"]
-    
-    logging.info("Iniciando a aplicação...")
-    initialize_firebase()
-    initialize_onnx_session()
-    await load_faiss_index()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global client
-    if client:
-        client.close()
-
 async def verify_firebase_token_dep(credentials: HTTPAuthorizationCredentials = Security(http_bearer)):
     try:
         decoded_token = auth.verify_id_token(credentials.credentials)
