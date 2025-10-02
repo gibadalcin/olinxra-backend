@@ -26,6 +26,7 @@ def get_public_ip():
         'https://ifconfig.me/ip',
         'https://ipinfo.io/ip'
     ]
+    ips = set()
     for service in services:
         try:
             resp = requests.get(service, timeout=5)
@@ -33,11 +34,14 @@ def get_public_ip():
             ip = resp.text.strip()
             if ip:
                 print(f'IP público detectado via {service}: {ip}')
-                return ip
+                ips.add(ip)
         except Exception as e:
             print(f'[AVISO] Falha ao obter IP via {service}: {e}')
-    print('[ERRO] Não foi possível detectar o IP público.')
-    sys.exit(1)
+    if not ips:
+        print('[ERRO] Não foi possível detectar o IP público.')
+        sys.exit(1)
+    # Retorna o IP mais comum entre os serviços (mitiga problemas de NAT/proxy)
+    return max(ips, key=lambda x: list(ips).count(x))
 
 if FORCE_IP:
     ip = FORCE_IP
@@ -46,8 +50,11 @@ else:
     ip = get_public_ip()
 
 # Exibe IP privado local para comparação
-local_ip = socket.gethostbyname(socket.gethostname())
-print(f'IP privado local: {local_ip}')
+try:
+    local_ip = socket.gethostbyname(socket.gethostname())
+    print(f'IP privado local: {local_ip}')
+except Exception as e:
+    print(f'[AVISO] Não foi possível obter o IP privado local: {e}')
 
 # Adiciona o IP à whitelist do Atlas
 url = f'https://cloud.mongodb.com/api/atlas/v1.0/groups/{ATLAS_PROJECT_ID}/accessList'
@@ -73,7 +80,6 @@ else:
     print(f'Detalhe da Resposta: {response.text}')
     sys.exit(1)
 
-# Aguarda propagação da whitelist antes de iniciar o backend
 print(f'Aguardando {PROPAGATION_WAIT} segundos para propagação da whitelist no Atlas...')
 time.sleep(PROPAGATION_WAIT)
-print('Propagação concluída. Pode iniciar o backend com segurança.')
+print('Propagação concluída. Agora inicie o deploy do backend manualmente usando este IP liberado.')
