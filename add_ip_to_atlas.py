@@ -1,7 +1,8 @@
 import requests
 import os
 import sys
-from requests.auth import HTTPDigestAuth # Importa a autenticação Digest
+import socket
+from requests.auth import HTTPDigestAuth
 from dotenv import load_dotenv
 
 # Carrega variáveis do .env (Apenas para desenvolvimento local, DigitalOcean usa ENV vars diretas)
@@ -11,20 +12,40 @@ load_dotenv()
 ATLAS_PUBLIC_KEY = os.getenv('ATLAS_PUBLIC_KEY')
 ATLAS_PRIVATE_KEY = os.getenv('ATLAS_PRIVATE_KEY')
 ATLAS_PROJECT_ID = os.getenv('ATLAS_PROJECT_ID')
+FORCE_IP = os.getenv('FORCE_PUBLIC_IP')  # Permite sobrescrever o IP manualmente
 
 if not ATLAS_PUBLIC_KEY or not ATLAS_PRIVATE_KEY or not ATLAS_PROJECT_ID:
     print("[ERRO] Variáveis ATLAS_PUBLIC_KEY, ATLAS_PRIVATE_KEY ou ATLAS_PROJECT_ID não encontradas!")
     sys.exit(1)
 
-# 1. Descobre o IP público atual
-try:
-    ip_response = requests.get('https://api.ipify.org', timeout=5)
-    ip_response.raise_for_status()
-    ip = ip_response.text.strip()
-    print(f'IP público detectado: {ip}')
-except requests.exceptions.RequestException as e:
-    print(f'[ERRO] Falha ao obter o IP público: {e}')
+def get_public_ip():
+    services = [
+        'https://api.ipify.org',
+        'https://ifconfig.me/ip',
+        'https://ipinfo.io/ip'
+    ]
+    for service in services:
+        try:
+            resp = requests.get(service, timeout=5)
+            resp.raise_for_status()
+            ip = resp.text.strip()
+            if ip:
+                print(f'IP público detectado via {service}: {ip}')
+                return ip
+        except Exception as e:
+            print(f'[AVISO] Falha ao obter IP via {service}: {e}')
+    print('[ERRO] Não foi possível detectar o IP público.')
     sys.exit(1)
+
+if FORCE_IP:
+    ip = FORCE_IP
+    print(f'IP público sobrescrito via ENV: {ip}')
+else:
+    ip = get_public_ip()
+
+# Exibe IP privado local para comparação
+local_ip = socket.gethostbyname(socket.gethostname())
+print(f'IP privado local: {local_ip}')
 
 # 2. Adiciona o IP à whitelist do Atlas
 # CORREÇÃO DA URI: A API espera uma LISTA de objetos JSON.
