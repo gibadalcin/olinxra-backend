@@ -2,7 +2,7 @@ import requests
 import os
 import sys
 import socket
-import time  # <-- Adicione esta linha
+import time 
 from requests.auth import HTTPDigestAuth
 from dotenv import load_dotenv
 
@@ -14,7 +14,6 @@ ATLAS_PUBLIC_KEY = os.getenv('ATLAS_PUBLIC_KEY')
 ATLAS_PRIVATE_KEY = os.getenv('ATLAS_PRIVATE_KEY')
 ATLAS_PROJECT_ID = os.getenv('ATLAS_PROJECT_ID')
 FORCE_IP = os.getenv('FORCE_PUBLIC_IP')  # Permite sobrescrever o IP manualmente
-PROPAGATION_WAIT = int(os.getenv('ATLAS_PROPAGATION_WAIT', '3'))  # Tempo de espera para propagação (segundos)
 
 if not ATLAS_PUBLIC_KEY or not ATLAS_PRIVATE_KEY or not ATLAS_PROJECT_ID:
     print("[ERRO] Variáveis ATLAS_PUBLIC_KEY, ATLAS_PRIVATE_KEY ou ATLAS_PROJECT_ID não encontradas!")
@@ -71,7 +70,3 @@ else:
     print(f'[ERRO] Falha ao adicionar IP: {response.status_code}')
     print(f'Detalhe da Resposta: {response.text}')
     sys.exit(1)
-
-print(f'Aguardando {PROPAGATION_WAIT} segundos para propagação da whitelist no Atlas...')
-time.sleep(PROPAGATION_WAIT)
-print('Propagação concluída. Agora inicie o deploy do backend manualmente usando este IP liberado.')
