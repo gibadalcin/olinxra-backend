@@ -39,7 +39,7 @@ def extract_clip_features(image_path, ort_session):
 
     if "text_input" in input_names:
         # Dummy: array de zeros (shape pode variar, normalmente (1, 77) para CLIP)
-        ort_input["text_input"] = np.zeros((1, 77), dtype=np.int64
+        ort_input["text_input"] = np.zeros((1, 77), dtype=np.int64)
 
     # Executa a inferência no modelo ONNX
     features = ort_session.run(None, ort_input)
