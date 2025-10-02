@@ -21,12 +21,10 @@ from email.mime.text import MIMEText
 import asyncio
 import onnxruntime as ort
 from motor.motor_asyncio import AsyncIOMotorClient
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 load_dotenv()
-
-
-from contextlib import asynccontextmanager
 
 logo_index = None
 ort_session = None
