@@ -1,3 +1,17 @@
+import pymongo
+import os
+
+uri = os.getenv("MONGO_URI")
+if not uri:
+    print("Variável de ambiente MONGO_URI não definida. Configure antes de rodar o teste.")
+    exit(1)
+
+try:
+    client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
+    print(client.list_database_names())
+    print("Conexão bem-sucedida!")
+except Exception as e:
+    print("Erro de conexão:", e)
 import pymongoimport pymongo
 
 import osimport os
