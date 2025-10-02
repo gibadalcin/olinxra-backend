@@ -43,6 +43,7 @@ def extract_clip_features(image_path, ort_session):
 
     # Executa a inferência no modelo ONNX
     features = ort_session.run(None, ort_input)
+    print("features:", [np.array(f).shape for f in features])
 
     # Retorna o vetor de features
     return features[0].flatten().tolist()
