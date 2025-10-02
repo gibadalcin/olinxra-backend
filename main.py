@@ -144,7 +144,8 @@ async def _search_and_compare_logic(file: UploadFile):
             return {
                 "found": True,
                 "name": match['metadata'].get('nome', 'Logo encontrado'),
-                "confidence": float(match['distance']),
+                "confidence": match.get('confidence'),
+                "distance": match.get('distance'),
                 "owner": match['metadata'].get('owner_uid', '')
             }
         
