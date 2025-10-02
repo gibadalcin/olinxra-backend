@@ -2,6 +2,7 @@ import requests
 import os
 import sys
 import socket
+import time
 from requests.auth import HTTPDigestAuth
 from dotenv import load_dotenv
 
@@ -13,6 +14,7 @@ ATLAS_PUBLIC_KEY = os.getenv('ATLAS_PUBLIC_KEY')
 ATLAS_PRIVATE_KEY = os.getenv('ATLAS_PRIVATE_KEY')
 ATLAS_PROJECT_ID = os.getenv('ATLAS_PROJECT_ID')
 FORCE_IP = os.getenv('FORCE_PUBLIC_IP')  # Permite sobrescrever o IP manualmente
+PROPAGATION_WAIT = int(os.getenv('ATLAS_PROPAGATION_WAIT', '30'))  # Tempo de espera para propagação (segundos)
 
 if not ATLAS_PUBLIC_KEY or not ATLAS_PRIVATE_KEY or not ATLAS_PROJECT_ID:
     print("[ERRO] Variáveis ATLAS_PUBLIC_KEY, ATLAS_PRIVATE_KEY ou ATLAS_PROJECT_ID não encontradas!")
@@ -47,8 +49,7 @@ else:
 local_ip = socket.gethostbyname(socket.gethostname())
 print(f'IP privado local: {local_ip}')
 
-# 2. Adiciona o IP à whitelist do Atlas
-# CORREÇÃO DA URI: A API espera uma LISTA de objetos JSON.
+# Adiciona o IP à whitelist do Atlas
 url = f'https://cloud.mongodb.com/api/atlas/v1.0/groups/{ATLAS_PROJECT_ID}/accessList'
 data = [
     {
@@ -57,11 +58,10 @@ data = [
     }
 ]
 
-# CORREÇÃO CRÍTICA: Usa HTTPDigestAuth, que é exigido pela API do Atlas para chaves de organização.
 response = requests.post(
     url,
     json=data,
-    auth=HTTPDigestAuth(ATLAS_PUBLIC_KEY, ATLAS_PRIVATE_KEY) 
+    auth=HTTPDigestAuth(ATLAS_PUBLIC_KEY, ATLAS_PRIVATE_KEY)
 )
 
 if response.status_code == 201:
@@ -69,7 +69,11 @@ if response.status_code == 201:
 elif response.status_code == 409:
     print(f'[AVISO] IP {ip} já está na whitelist.')
 else:
-    # Captura o erro e falha o build
     print(f'[ERRO] Falha ao adicionar IP: {response.status_code}')
     print(f'Detalhe da Resposta: {response.text}')
-    sys.exit(1) # Força a falha do build
+    sys.exit(1)
+
+# Aguarda propagação da whitelist antes de iniciar o backend
+print(f'Aguardando {PROPAGATION_WAIT} segundos para propagação da whitelist no Atlas...')
+time.sleep(PROPAGATION_WAIT)
+print('Propagação concluída. Pode iniciar o backend com segurança.')
