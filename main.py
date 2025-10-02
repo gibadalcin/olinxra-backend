@@ -25,13 +25,37 @@ from motor.motor_asyncio import AsyncIOMotorClient
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 load_dotenv()
 
-app = FastAPI()
+
+from contextlib import asynccontextmanager
+
 logo_index = None
 ort_session = None
 http_bearer = HTTPBearer()
 client = None
 db = None
 logos_collection = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client, db, logos_collection
+    MONGO_URI = os.getenv("MONGO_URI")
+    if not MONGO_URI:
+        raise RuntimeError("Variável de ambiente MONGO_URI não encontrada.")
+    DB_NAME = os.getenv("MONGO_DB_NAME", "olinxra")
+
+    client = AsyncIOMotorClient(MONGO_URI)
+    db = client[DB_NAME]
+    logos_collection = db["logos"]
+
+    logging.info("Iniciando a aplicação...")
+    initialize_firebase()
+    initialize_onnx_session()
+    await load_faiss_index()
+    yield
+    if client:
+        client.close()
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Helpers de Inicialização ---
 def initialize_firebase():
