@@ -25,12 +25,24 @@ def extract_clip_features(image_path, ort_session):
     image = image.resize((224, 224))
     image_np = np.array(image, dtype=np.float32) / 255.0
     image_np = np.transpose(image_np, (2, 0, 1)) # Transforma para o formato (C, H, W)
-    
-    # O ONNX espera uma dimensão de batch.
-    ort_input = {ort_session.get_inputs()[0].name: np.expand_dims(image_np, axis=0)}
-    
+
+    # Descobre os inputs esperados pelo modelo
+    ort_inputs = ort_session.get_inputs()
+    input_names = [inp.name for inp in ort_inputs]
+    ort_input = {}
+
+    if "image_input" in input_names:
+        ort_input["image_input"] = np.expand_dims(image_np, axis=0)
+    else:
+        # fallback: usa o primeiro input
+        ort_input[ort_inputs[0].name] = np.expand_dims(image_np, axis=0)
+
+    if "text_input" in input_names:
+        # Dummy: array de zeros (shape pode variar, normalmente (1, 77) para CLIP)
+        ort_input["text_input"] = np.zeros((1, 77), dtype=np.float32)
+
     # Executa a inferência no modelo ONNX
     features = ort_session.run(None, ort_input)
-    
+
     # Retorna o vetor de features
     return features[0].flatten().tolist()
