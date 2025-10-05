@@ -22,6 +22,7 @@ import asyncio
 import onnxruntime as ort
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
+import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 load_dotenv()
@@ -342,3 +343,85 @@ async def debug_inspect_request(data: dict = Body(...)):
     import logging
     logging.info(f'[debug-inspect-request] Corpo recebido: {str(data)[:500]}')
     return {"received": data}
+
+async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude):
+    return await db["conteudos"].find_one({
+        "marca_id": str(marca_id),
+        "latitude": {"$gte": latitude - 0.01, "$lte": latitude + 0.01},
+        "longitude": {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
+    })
+
+async def geocode_reverse(lat, lon):
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "format": "json",
+        "addressdetails": 1
+    }
+    headers = {"User-Agent": "OlinxRA/1.0"}
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code == 200:
+        return response.json().get("address", {})
+    return {}
+
+# Cache em memória: {(nome_marca, latitude, longitude): resultado}
+consulta_cache = {}
+
+def make_cache_key(nome_marca, latitude, longitude):
+    # Arredonda para evitar pequenas variações
+    return (nome_marca, round(latitude, 6), round(longitude, 6))
+
+@app.post('/consulta-conteudo/')
+async def consulta_conteudo(
+    nome_marca: str = Body(...),
+    latitude: float = Body(...),
+    longitude: float = Body(...)
+):
+    cache_key = make_cache_key(nome_marca, latitude, longitude)
+    if cache_key in consulta_cache:
+        return consulta_cache[cache_key]
+
+    # Busca a marca no banco
+    marca = await logos_collection.find_one({"nome": nome_marca})
+    if not marca:
+        resultado = {"conteudo": None, "mensagem": "Marca não encontrada."}
+        consulta_cache[cache_key] = resultado
+        return resultado
+
+    # Busca conteúdo associado à marca e localização usando a função
+    conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude)
+
+    # Busca endereço detalhado usando geocodificação reversa
+    endereco = await geocode_reverse(latitude, longitude)
+
+    # Monta string do local (exemplo: Rua, Bairro, Cidade, Estado, País)
+    local_str = ", ".join([
+        endereco.get("road", ""),
+        endereco.get("suburb", ""),
+        endereco.get("city", endereco.get("town", endereco.get("village", ""))),
+        endereco.get("state", ""),
+        endereco.get("country", "")
+    ])
+    local_str = local_str.strip(", ").replace(",,", ",")
+
+    if conteudo:
+        resultado = {
+            "conteudo": {
+                "texto": conteudo.get("texto", ""),
+                "imagens": conteudo.get("imagens", []),  # lista de URLs
+                "videos": conteudo.get("videos", []),    # lista de URLs
+                # outros campos para RA podem ser adicionados aqui
+            },
+            "mensagem": "Conteúdo encontrado.",
+            "localizacao": local_str
+        }
+    else:
+        resultado = {
+            "conteudo": None,
+            "mensagem": f"Nenhum conteúdo associado a esta marca neste local: {local_str}.",
+            "localizacao": local_str
+        }
+
+    consulta_cache[cache_key] = resultado
+    return resultado
