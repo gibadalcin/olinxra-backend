@@ -425,3 +425,11 @@ async def consulta_conteudo(
 
     consulta_cache[cache_key] = resultado
     return resultado
+
+@app.get('/api/marcas')
+async def listar_marcas(
+    adminUid: str = Query(...),
+    token: dict = Depends(verify_firebase_token_dep)
+):
+    marcas = await logos_collection.find({"owner_uid": adminUid}).to_list(length=100)
+    return [{"id": str(marca["_id"]), "nome": marca.get("nome", "")} for marca in marcas]
