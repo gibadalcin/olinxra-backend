@@ -215,13 +215,10 @@ async def add_logo(
             contents = await file.read()
             temp_file.write(contents)
             temp_path = temp_file.name
-        
         features = extract_clip_features(temp_path, ort_session)
         features = np.array(features, dtype=np.float32)
         features /= np.linalg.norm(features)
-        
         gcs_url = upload_image_to_gcs(temp_path, os.path.basename(file.filename))
-        
         doc = {
             "nome": name,
             "url": gcs_url,
@@ -244,9 +241,24 @@ async def get_images(ownerId: str = None):
     filtro = {}
     if ownerId:
         filtro = {"owner_uid": ownerId}
-    imagens = await images_collection.find(filtro).to_list(length=100)
+    imagens = await logos_collection.find(filtro).to_list(length=100)
     logging.info(f"Imagens encontradas: {imagens}")
-    return [{"url": img.get("url"), "_id": str(img.get("_id")), "owner_uid": img.get("owner_uid"), "nome": img.get("nome", "")} for img in imagens]
+    def montar_url(img):
+        filename = img.get("filename")
+        if not filename:
+            return ""
+        try:
+            # Gera uma signed URL válida por 1 hora
+            url = bucket.blob(filename).generate_signed_url(
+                version="v4",
+                expiration=3600,
+                method="GET"
+            )
+            return url
+        except Exception as e:
+            logging.error(f"Erro ao gerar signed URL para {filename}: {e}")
+            return ""
+    return [{"url": montar_url(img), "_id": str(img.get("_id")), "owner_uid": img.get("owner_uid"), "nome": img.get("nome", "")} for img in imagens]
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
@@ -258,7 +270,15 @@ async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebas
     if not logo:
         raise HTTPException(status_code=404, detail="Imagem não encontrada")
     blob = bucket.blob(logo['filename'])
-    blob.delete()
+    try:
+        blob.delete()
+    except Exception as e:
+        from google.api_core.exceptions import NotFound
+        if isinstance(e, NotFound):
+            # Arquivo já não existe, segue normalmente
+            pass
+        else:
+            raise HTTPException(status_code=500, detail=f"Erro ao deletar arquivo do bucket: {str(e)}")
     await logos_collection.delete_one({"_id": object_id})
     return {"success": True}
 
@@ -415,8 +435,10 @@ async def consulta_conteudo(
 
 @app.get('/api/marcas')
 async def listar_marcas(
-    ownerId: str = Query(...),
+    ownerId: str = Query(..., description="ID do usuário dono das marcas"),
     token: dict = Depends(verify_firebase_token_dep)
 ):
+    if not ownerId:
+        raise HTTPException(status_code=422, detail="Parâmetro 'ownerId' é obrigatório.")
     marcas = await logos_collection.find({"owner_uid": ownerId}).to_list(length=100)
     return [{"id": str(marca["_id"]), "nome": marca.get("nome", "")} for marca in marcas]
