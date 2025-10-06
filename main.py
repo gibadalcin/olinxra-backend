@@ -240,10 +240,9 @@ async def add_logo(
 
 @app.get('/images')
 async def get_images(ownerId: str = None):
-    if ownerId:
-        imagens = await images_collection.find({"owner_uid": ownerId}).to_list(length=100)
-    else:
-        imagens = await images_collection.find().to_list(length=100)
+    logging.info(f"ownerId recebido: '{ownerId}'")
+    imagens = await images_collection.find({"owner_uid": ownerId}).to_list(length=100) if ownerId else await images_collection.find().to_list(length=100)
+    logging.info(f"Imagens encontradas: {imagens}")
     return [{"url": img["url"], "_id": str(img["_id"]), "owner_uid": img["owner_uid"]} for img in imagens]
 
 @app.delete('/delete-logo/')
