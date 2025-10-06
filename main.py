@@ -33,10 +33,11 @@ http_bearer = HTTPBearer()
 client = None
 db = None
 logos_collection = None
+images_collection = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, db, logos_collection
+    global client, db, logos_collection, images_collection
     MONGO_URI = os.getenv("MONGO_URI")
     if not MONGO_URI:
         raise RuntimeError("Variável de ambiente MONGO_URI não encontrada.")
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     logos_collection = db["logos"]
+    images_collection = db["images"]
 
     logging.info("Iniciando a aplicação...")
     initialize_firebase()
@@ -237,29 +239,12 @@ async def add_logo(
     return {"success": True, "id": str(result.inserted_id)}
 
 @app.get('/images')
-async def get_images(token: dict = Depends(verify_firebase_token_dep)):
-    master_email = os.getenv("USER_ADMIN_EMAIL")
-    if token.get("email") == master_email:
-        logos = await logos_collection.find({}).to_list(length=1000)
+async def get_images(ownerId: str = None):
+    if ownerId:
+        imagens = await images_collection.find({"owner_uid": ownerId}).to_list(length=100)
     else:
-        logos = await logos_collection.find({"owner_uid": token["uid"]}).to_list(length=1000)
-    
-    imagens = []
-    for logo in logos:
-        blob = bucket.blob(logo['filename'])
-        signed_url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=15),
-            method="GET"
-        )
-        imagens.append({
-            "_id": str(logo["_id"]),
-            "nome": logo.get("nome", ""),
-            "url": signed_url,
-            "owner_uid": logo.get("owner_uid", ""),
-            "owner_email": logo.get("owner_email", "")
-        })
-    return imagens
+        imagens = await images_collection.find().to_list(length=100)
+    return [{"url": img["url"], "_id": str(img["_id"]), "owner_uid": img["owner_uid"]} for img in imagens]
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
