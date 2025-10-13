@@ -442,3 +442,72 @@ async def listar_marcas(
         raise HTTPException(status_code=422, detail="Parâmetro 'ownerId' é obrigatório.")
     marcas = await logos_collection.find({"owner_uid": ownerId}).to_list(length=100)
     return [{"id": str(marca["_id"]), "nome": marca.get("nome", "")} for marca in marcas]
+
+@app.get('/api/conteudo')
+async def get_conteudo(
+    nome_marca: str = Query(..., description="Nome da marca"),
+    latitude: float = Query(..., description="Latitude"),
+    longitude: float = Query(..., description="Longitude")
+):
+    cache_key = (nome_marca, round(latitude, 6), round(longitude, 6))
+    if cache_key in consulta_cache:
+        return consulta_cache[cache_key]
+
+    marca = await logos_collection.find_one({"nome": nome_marca})
+    if not marca:
+        resultado = {"conteudo": None, "mensagem": "Marca não encontrada."}
+        consulta_cache[cache_key] = resultado
+        return resultado
+
+    conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude)
+    endereco = await geocode_reverse(latitude, longitude)
+    local_str = ", ".join([
+        endereco.get("road", ""),
+        endereco.get("suburb", ""),
+        endereco.get("city", endereco.get("town", endereco.get("village", ""))),
+        endereco.get("state", ""),
+        endereco.get("country", "")
+    ])
+    local_str = local_str.strip(", ").replace(",,", ",")
+
+    if conteudo:
+        resultado = {
+            "conteudo": {
+                "texto": conteudo.get("texto", ""),
+                "imagens": conteudo.get("imagens", []),
+                "videos": conteudo.get("videos", []),
+            },
+            "mensagem": "Conteúdo encontrado.",
+            "localizacao": local_str
+        }
+    else:
+        resultado = {
+            "conteudo": None,
+            "mensagem": f"Nenhum conteúdo associado a esta marca neste local: {local_str}.",
+            "localizacao": local_str
+        }
+
+    consulta_cache[cache_key] = resultado
+    return resultado
+@app.get('/api/conteudo')
+async def get_conteudo_por_regiao(
+    nome_marca: str = Query(...),
+    tipo_regiao: str = Query(None),
+    nome_regiao: str = Query(None)
+):
+    # Busca a marca no banco
+    marca = await logos_collection.find_one({"nome": nome_marca})
+    if not marca:
+        return {"blocos": []}
+
+    # Busca conteúdo associado à marca e região
+    filtro = {"nome_marca": nome_marca}
+    if tipo_regiao:
+        filtro["tipo_regiao"] = tipo_regiao
+    if nome_regiao:
+        filtro["nome_regiao"] = nome_regiao
+    conteudo = await db["conteudos"].find_one(filtro)
+    if conteudo:
+        conteudo["_id"] = str(conteudo["_id"])
+        return conteudo
+    return {"blocos": []}
