@@ -1,3 +1,5 @@
+from fastapi import Request
+# Endpoint para cadastrar conteúdo (blocos) por marca e localização
 import logging
 import json
 import os
@@ -472,11 +474,7 @@ async def get_conteudo(
 
     if conteudo:
         resultado = {
-            "conteudo": {
-                "texto": conteudo.get("texto", ""),
-                "imagens": conteudo.get("imagens", []),
-                "videos": conteudo.get("videos", []),
-            },
+            "conteudo": conteudo.get("blocos", None) if conteudo.get("blocos") else None,
             "mensagem": "Conteúdo encontrado.",
             "localizacao": local_str
         }
@@ -509,5 +507,51 @@ async def get_conteudo_por_regiao(
     conteudo = await db["conteudos"].find_one(filtro)
     if conteudo:
         conteudo["_id"] = str(conteudo["_id"])
-        return conteudo
+        return {
+            "blocos": conteudo.get("blocos", []),
+            "tipo_regiao": conteudo.get("tipo_regiao"),
+            "nome_regiao": conteudo.get("nome_regiao"),
+            "latitude": conteudo.get("latitude"),
+            "longitude": conteudo.get("longitude"),
+        }
     return {"blocos": []}
+
+@app.post('/api/conteudo')
+async def create_conteudo(request: Request):
+    data = await request.json()
+    print("[POST /api/conteudo] Dados recebidos:", data)
+    nome_marca = data.get("nome_marca")
+    blocos = data.get("blocos", [])
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+    tipo_regiao = data.get("tipo_regiao")
+    nome_regiao = data.get("nome_regiao")
+    if not nome_marca or latitude is None or longitude is None:
+        raise HTTPException(status_code=422, detail="Parâmetros obrigatórios ausentes.")
+
+    marca = await logos_collection.find_one({"nome": nome_marca})
+    if not marca:
+        raise HTTPException(status_code=404, detail="Marca não encontrada.")
+
+    lat_rounded = round(float(latitude), 6)
+    lon_rounded = round(float(longitude), 6)
+    conteudo_doc = {
+        "marca_id": str(marca["_id"]),
+        "nome_marca": nome_marca,
+        "latitude": lat_rounded,
+        "longitude": lon_rounded,
+        "tipo_regiao": tipo_regiao,
+        "nome_regiao": nome_regiao,
+        "blocos": blocos,
+    }
+    # Upsert: atualiza se já existe, senão cria
+    result = await db["conteudos"].update_one(
+        {
+            "marca_id": str(marca["_id"]),
+            "tipo_regiao": tipo_regiao,
+            "nome_regiao": nome_regiao
+        },
+        {"$set": conteudo_doc},
+        upsert=True
+    )
+    return {"success": True, "conteudo_id": str(result.upserted_id) if result.upserted_id else "updated"}
