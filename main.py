@@ -137,13 +137,14 @@ async def _search_and_compare_logic(file: UploadFile):
             contents = await file.read()
             temp_file.write(contents)
             temp_path = temp_file.name
-        
+
         query_vector = extract_clip_features(temp_path, ort_session)
         import numpy as np
         print("query_vector shape:", np.array(query_vector).shape)
+        print("query_vector values:", np.array(query_vector).tolist())
         print("faiss index dimension:", logo_index.index.d)
         results = logo_index.search(query_vector, top_k=1)
-        
+
         if results:
             match = results[0]
             return {
@@ -151,17 +152,17 @@ async def _search_and_compare_logic(file: UploadFile):
                 "name": match['metadata'].get('nome', 'Logo encontrado'),
                 "confidence": float(match.get('confidence', 0)),
                 "distance": float(match.get('distance', 0)),
-                "owner": match['metadata'].get('owner_uid', '')
+                "owner": match['metadata'].get('owner_uid', ''),
+                "query_vector": np.array(query_vector).tolist()
             }
-        
-        return {"found": False, "debug": "Nenhum match encontrado"}
-    
+
+        return {"found": False, "debug": "Nenhum match encontrado", "query_vector": np.array(query_vector).tolist()}
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
 @app.post('/search-logo/')
-async def search_logo_public(file: UploadFile = File(...)):
+async def search_logo(file: UploadFile = File(...)):
     return await _search_and_compare_logic(file)
 
 @app.post('/authenticated-search-logo/')
