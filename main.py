@@ -1,10 +1,9 @@
-from fastapi import Request
-# Endpoint para cadastrar conteúdo (blocos) por marca e localização
 import logging
 import json
 import os
 import numpy as np
 import firebase_admin
+from fastapi import Request
 from firebase_admin import credentials, auth
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Form, Query, Body, Security
 from fastapi.middleware.cors import CORSMiddleware
