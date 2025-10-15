@@ -373,6 +373,13 @@ async def geocode_reverse(lat, lon):
     if response.status_code == 200:
         return response.json().get("address", {})
     return {}
+@app.get('/api/reverse-geocode')
+async def api_reverse_geocode(lat: float = Query(...), lon: float = Query(...)):
+    try:
+        address = await geocode_reverse(lat, lon)
+        return address
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro na geocodificação reversa: {str(e)}")
 
 # Cache em memória: {(nome_marca, latitude, longitude): resultado}
 consulta_cache = {}
