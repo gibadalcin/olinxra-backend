@@ -494,7 +494,7 @@ async def get_conteudo(
 
     consulta_cache[cache_key] = resultado
     return resultado
-@app.get('/api/conteudo')
+@app.get('/api/conteudo-por-regiao')
 async def get_conteudo_por_regiao(
     nome_marca: str = Query(...),
     tipo_regiao: str = Query(None),
@@ -551,6 +551,18 @@ async def create_conteudo(request: Request):
         "nome_regiao": nome_regiao,
         "blocos": blocos,
     }
+    # Se blocos está vazio, exclui o documento correspondente
+    if not blocos:
+        delete_result = await db["conteudos"].delete_one({
+            "marca_id": str(marca["_id"]),
+            "tipo_regiao": tipo_regiao,
+            "nome_regiao": nome_regiao
+        })
+        return {
+            "success": True,
+            "action": "deleted",
+            "deleted": delete_result.deleted_count
+        }
     # Upsert: atualiza se já existe, senão cria
     result = await db["conteudos"].update_one(
         {
@@ -561,4 +573,8 @@ async def create_conteudo(request: Request):
         {"$set": conteudo_doc},
         upsert=True
     )
-    return {"success": True, "conteudo_id": str(result.upserted_id) if result.upserted_id else "updated"}
+    return {
+        "success": True,
+        "action": "saved",
+        "conteudo_id": str(result.upserted_id) if result.upserted_id else "updated"
+    }
