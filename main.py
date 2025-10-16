@@ -567,6 +567,7 @@ async def add_content_image(
     t0 = time.time()
     try:
         ext = os.path.splitext(file.filename)[-1]
+        name_base = os.path.splitext(name)[0]
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
             contents = await file.read()
             temp_file.write(contents)
@@ -574,7 +575,7 @@ async def add_content_image(
         t1 = time.time()
         logging.info(f"[add_content_image] Tempo até upload GCS: {t1-t0:.2f}s")
         # Salva no bucket olinxra-conteudo, organizado por admin
-        gcs_filename = f"{token['uid']}/{name}{ext}"
+        gcs_filename = f"{token['uid']}/{name_base}{ext}"
         gcs_url = upload_image_to_gcs(temp_path, gcs_filename, tipo="conteudo")
         t2 = time.time()
         logging.info(f"[add_content_image] Tempo upload GCS: {t2-t1:.2f}s (total: {t2-t0:.2f}s)")
