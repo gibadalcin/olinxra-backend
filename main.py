@@ -1,3 +1,37 @@
+from fastapi import Query
+# Função utilitária para gerar signed URL de conteúdo
+from gcs_utils import get_bucket
+def gerar_signed_url_conteudo(gs_url, filename=None):
+    # Detecta bucket pelo prefixo ou filename
+    tipo_bucket = "conteudo"
+    if gs_url.startswith("gs://olinxra-logos/"):
+        tipo_bucket = "logos"
+    elif gs_url.startswith("gs://olinxra-conteudo/"):
+        tipo_bucket = "conteudo"
+    elif filename and "conteudo" in filename:
+        tipo_bucket = "conteudo"
+    else:
+        tipo_bucket = "logos"
+    # Extrai filename do gs_url se não informado
+    if not filename:
+        filename = gs_url.split("/", 3)[-1]
+    try:
+        bucket = get_bucket(tipo_bucket)
+        url = bucket.blob(filename).generate_signed_url(
+            version="v4",
+            expiration=3600,
+            method="GET"
+        )
+        return url
+    except Exception as e:
+        logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
+        return ""
+
+# Endpoint para gerar signed URL de conteúdo
+@app.get("/api/conteudo-signed-url")
+async def get_conteudo_signed_url(gs_url: str = Query(...), filename: str = Query(None)):
+    url = gerar_signed_url_conteudo(gs_url, filename)
+    return {"signed_url": url}
 import logging
 import json
 import os
