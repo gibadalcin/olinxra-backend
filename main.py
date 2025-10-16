@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
-from datetime import timedelta
+from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
@@ -28,17 +28,18 @@ import requests
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 load_dotenv()
 
+
 logo_index = None
 ort_session = None
 http_bearer = HTTPBearer()
 client = None
 db = None
 logos_collection = None
-images_collection = None
+# REMOVIDO: images_collection = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, db, logos_collection, images_collection
+    global client, db, logos_collection
     MONGO_URI = os.getenv("MONGO_URI")
     if not MONGO_URI:
         raise RuntimeError("Variável de ambiente MONGO_URI não encontrada.")
@@ -47,7 +48,7 @@ async def lifespan(app: FastAPI):
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     logos_collection = db["logos"]
-    images_collection = db["images"]
+    # REMOVIDO: images_collection = db["images"]
 
     logging.info("Iniciando a aplicação...")
     initialize_firebase()
@@ -245,12 +246,25 @@ async def get_images(ownerId: str = None):
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
     logging.info(f"Imagens encontradas: {imagens}")
+    from gcs_utils import get_bucket
     def montar_url(img):
         filename = img.get("filename")
+        url_gcs = img.get("url", "")
         if not filename:
+            logging.error(f"Imagem sem filename: {img}")
             return ""
+        # Detecta o tipo de bucket pelo prefixo da URL salva no banco
+        tipo_bucket = "logos"
+        if url_gcs.startswith("gs://olinxra-conteudo/"):
+            tipo_bucket = "conteudo"
+        elif url_gcs.startswith("gs://olinxra-logos/"):
+            tipo_bucket = "logos"
+        else:
+            # fallback: tenta pelo nome do bucket no filename
+            if "conteudo" in filename:
+                tipo_bucket = "conteudo"
         try:
-            # Gera uma signed URL válida por 1 hora
+            bucket = get_bucket(tipo_bucket)
             url = bucket.blob(filename).generate_signed_url(
                 version="v4",
                 expiration=3600,
@@ -258,9 +272,14 @@ async def get_images(ownerId: str = None):
             )
             return url
         except Exception as e:
-            logging.error(f"Erro ao gerar signed URL para {filename}: {e}")
+            logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
             return ""
-    return [{"url": montar_url(img), "_id": str(img.get("_id")), "owner_uid": img.get("owner_uid"), "nome": img.get("nome", "")} for img in imagens]
+    return [{
+        "url": montar_url(img),
+        "_id": str(img.get("_id")),
+        "owner_uid": img.get("owner_uid"),
+        "nome": img.get("nome", "")
+    } for img in imagens]
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
@@ -271,6 +290,8 @@ async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebas
     logo = await logos_collection.find_one({"_id": object_id})
     if not logo:
         raise HTTPException(status_code=404, detail="Imagem não encontrada")
+    from gcs_utils import get_bucket
+    bucket = get_bucket("logos")
     blob = bucket.blob(logo['filename'])
     try:
         blob.delete()
@@ -525,95 +546,78 @@ async def get_conteudo_por_regiao(
         }
     return {"blocos": []}
 
-@app.post('/api/conteudo')
-async def create_conteudo(request: Request):
-    data = await request.json()
-    print("[POST /api/conteudo] Dados recebidos:", data)
-    nome_marca = data.get("nome_marca")
-    blocos = data.get("blocos", [])
-    latitude = data.get("latitude")
-    longitude = data.get("longitude")
-    tipo_regiao = data.get("tipo_regiao")
-    nome_regiao = data.get("nome_regiao")
-    if not nome_marca or latitude is None or longitude is None:
-        raise HTTPException(status_code=422, detail="Parâmetros obrigatórios ausentes.")
-
-    marca = await logos_collection.find_one({"nome": nome_marca})
-    if not marca:
-        raise HTTPException(status_code=404, detail="Marca não encontrada.")
-
-    lat_rounded = round(float(latitude), 6)
-    lon_rounded = round(float(longitude), 6)
-    conteudo_doc = {
-        "marca_id": str(marca["_id"]),
-        "nome_marca": nome_marca,
-        "latitude": lat_rounded,
-        "longitude": lon_rounded,
-        "tipo_regiao": tipo_regiao,
-        "nome_regiao": nome_regiao,
-        "blocos": blocos,
-    }
-    # Se blocos está vazio, exclui o documento correspondente
-    if not blocos:
-        delete_result = await db["conteudos"].delete_one({
-            "marca_id": str(marca["_id"]),
-            "tipo_regiao": tipo_regiao,
-            "nome_regiao": nome_regiao
-        })
-        return {
-            "success": True,
-            "action": "deleted",
-            "deleted": delete_result.deleted_count
-        }
-    # Upsert: atualiza se já existe, senão cria
-    result = await db["conteudos"].update_one(
-        {
-            "marca_id": str(marca["_id"]),
-            "tipo_regiao": tipo_regiao,
-            "nome_regiao": nome_regiao
-        },
-        {"$set": conteudo_doc},
-        upsert=True
-    )
-    return {
-        "success": True,
-        "action": "saved",
-        "conteudo_id": str(result.upserted_id) if result.upserted_id else "updated"
-    }
 
 @app.post('/add-content-image/')
 async def add_content_image(
     file: UploadFile = File(...),
     name: str = Form(...),
+    tipo_bloco: str = Form("imagem"),
+    subtipo: str = Form(""),
+    marca: str = Form(""),
+    tipo_regiao: str = Form(""),
+    nome_regiao: str = Form(""),
     token: dict = Depends(verify_firebase_token_dep)
 ):
     allowed_types = ["image/png", "image/jpeg", "video/mp4"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido.")
 
+    import time
     temp_path = None
+    t0 = time.time()
     try:
         ext = os.path.splitext(file.filename)[-1]
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
             contents = await file.read()
             temp_file.write(contents)
             temp_path = temp_file.name
+        t1 = time.time()
+        logging.info(f"[add_content_image] Tempo até upload GCS: {t1-t0:.2f}s")
         # Salva no bucket olinxra-conteudo, organizado por admin
-        gcs_filename = f"conteudo/{token['uid']}/{name}{ext}"
-        gcs_url = upload_image_to_gcs(temp_path, gcs_filename)
-        # Salva referência no banco
-        doc = {
-            "nome": name,
+        gcs_filename = f"{token['uid']}/{name}{ext}"
+        gcs_url = upload_image_to_gcs(temp_path, gcs_filename, tipo="conteudo")
+        t2 = time.time()
+        logging.info(f"[add_content_image] Tempo upload GCS: {t2-t1:.2f}s (total: {t2-t0:.2f}s)")
+
+        # Busca documento de conteúdo existente
+        filtro = {
+            "nome_marca": marca,
+            "tipo_regiao": tipo_regiao,
+            "nome_regiao": nome_regiao,
+            "owner_uid": token["uid"]
+        }
+        conteudo_doc = await db["conteudos"].find_one(filtro)
+        bloco_img = {
+            "tipo": tipo_bloco,
+            "subtipo": subtipo,
             "url": gcs_url,
+            "nome": name,
             "filename": gcs_filename,
-            "owner_uid": token["uid"],
             "type": file.content_type
         }
-        result = await images_collection.insert_one(doc)
+        if conteudo_doc:
+            # Só adiciona se não existir bloco com mesmo filename
+            blocos = conteudo_doc.get("blocos", [])
+            if not any(b.get("filename") == bloco_img["filename"] for b in blocos):
+                await db["conteudos"].update_one(
+                    filtro,
+                    {"$push": {"blocos": bloco_img}}
+                )
+            conteudo_id = str(conteudo_doc["_id"])
+        else:
+            # Cria novo documento de conteúdo
+            novo_doc = {
+                **filtro,
+                "blocos": [bloco_img],
+                "created_at": str(datetime.utcnow())
+            }
+            result = await db["conteudos"].insert_one(novo_doc)
+            conteudo_id = str(result.inserted_id)
+        t3 = time.time()
+        logging.info(f"[add_content_image] Tempo MongoDB: {t3-t2:.2f}s (total: {t3-t0:.2f}s)")
+        return {"success": True, "conteudo_id": conteudo_id, "url": gcs_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
-
-    return {"success": True, "id": str(result.inserted_id), "url": gcs_url}
