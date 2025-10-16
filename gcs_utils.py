@@ -45,10 +45,3 @@ def upload_image_to_gcs(local_path, filename, tipo="logos"):
     gcs_url = f"gs://{bucket.name}/{filename}"
     return gcs_url
 
-def get_bucket(tipo="logos"):
-    from google.cloud import storage
-    if tipo == "conteudo":
-        bucket_name = os.getenv("GCS_BUCKET_CONTEUDO")
-    else:
-        bucket_name = os.getenv("GCS_BUCKET_LOGOS")
-    return storage_client.bucket(bucket_name)
