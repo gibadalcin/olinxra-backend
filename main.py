@@ -75,9 +75,15 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
         tipo_bucket = "conteudo"
     else:
         tipo_bucket = "logos"
-    # Extrai filename do gs_url se não informado
+    # Extrai o caminho completo após o nome do bucket se não informado
     if not filename:
-        filename = gs_url.split("/", 3)[-1]
+        if gs_url.startswith("gs://olinxra-conteudo/"):
+            filename = gs_url[len("gs://olinxra-conteudo/"):]
+        elif gs_url.startswith("gs://olinxra-logos/"):
+            filename = gs_url[len("gs://olinxra-logos/"):]
+        else:
+            # fallback: tenta pegar o nome do arquivo (última parte do path)
+            filename = gs_url.split("/")[-1]
     try:
         bucket = get_bucket(tipo_bucket)
         url = bucket.blob(filename).generate_signed_url(
