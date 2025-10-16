@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta
-from gcs_utils import upload_image_to_gcs, bucket
+from gcs_utils import upload_image_to_gcs
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
 import tempfile
@@ -373,6 +373,7 @@ async def geocode_reverse(lat, lon):
     if response.status_code == 200:
         return response.json().get("address", {})
     return {}
+
 @app.get('/api/reverse-geocode')
 async def api_reverse_geocode(lat: float = Query(...), lon: float = Query(...)):
     try:
@@ -494,6 +495,7 @@ async def get_conteudo(
 
     consulta_cache[cache_key] = resultado
     return resultado
+
 @app.get('/api/conteudo-por-regiao')
 async def get_conteudo_por_regiao(
     nome_marca: str = Query(...),
@@ -578,3 +580,40 @@ async def create_conteudo(request: Request):
         "action": "saved",
         "conteudo_id": str(result.upserted_id) if result.upserted_id else "updated"
     }
+
+@app.post('/add-content-image/')
+async def add_content_image(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    token: dict = Depends(verify_firebase_token_dep)
+):
+    allowed_types = ["image/png", "image/jpeg", "video/mp4"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido.")
+
+    temp_path = None
+    try:
+        ext = os.path.splitext(file.filename)[-1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+            contents = await file.read()
+            temp_file.write(contents)
+            temp_path = temp_file.name
+        # Salva no bucket olinxra-conteudo, organizado por admin
+        gcs_filename = f"conteudo/{token['uid']}/{name}{ext}"
+        gcs_url = upload_image_to_gcs(temp_path, gcs_filename)
+        # Salva referência no banco
+        doc = {
+            "nome": name,
+            "url": gcs_url,
+            "filename": gcs_filename,
+            "owner_uid": token["uid"],
+            "type": file.content_type
+        }
+        result = await images_collection.insert_one(doc)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    return {"success": True, "id": str(result.inserted_id), "url": gcs_url}

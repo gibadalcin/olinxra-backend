@@ -1,3 +1,4 @@
+
 import os
 import json
 from google.cloud import storage
@@ -5,46 +6,49 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Nomes das variáveis de ambiente para o GCS
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET")
+# Variáveis de ambiente para múltiplos buckets
+GCS_BUCKET_LOGOS = os.getenv("GCS_BUCKET_LOGOS")
+GCS_BUCKET_CONTEUDO = os.getenv("GCS_BUCKET_CONTEUDO")
 GCS_CREDENTIALS_JSON = os.getenv("CLOUD_STORAGE_CRED_JSON")
 
 if not GCS_CREDENTIALS_JSON:
-    # Se a variável de ambiente não estiver definida (como em testes locais)
-    # o código irá falhar aqui. Em produção, ele deve estar presente.
     raise RuntimeError("Variável de ambiente CLOUD_STORAGE_CRED_JSON não encontrada.")
 
 if GCS_CREDENTIALS_JSON.startswith('"') and GCS_CREDENTIALS_JSON.endswith('"'):
-    GCS_CREDENTIALS_JSON = GCS_CREDENTIALS_JSON[1:-1]  # Remove aspas duplas externas
-GCS_CREDENTIALS_JSON = GCS_CREDENTIALS_JSON.replace('\\"', '"')  # Corrige aspas escapadas
+    GCS_CREDENTIALS_JSON = GCS_CREDENTIALS_JSON[1:-1]
+GCS_CREDENTIALS_JSON = GCS_CREDENTIALS_JSON.replace('\\"', '"')
 
 try:
-    # Carrega o conteúdo JSON da variável de ambiente
     cred_dict = json.loads(GCS_CREDENTIALS_JSON)
-    
-    # CORREÇÃO: Desfaz o escape da chave privada para o formato PEM,
-    # caso ela tenha sido colada em linha única na variável de ambiente.
     if 'private_key' in cred_dict:
         cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
-    
-    # Cria o cliente a partir do dicionário de credenciais
     storage_client = storage.Client.from_service_account_info(cred_dict)
 except json.JSONDecodeError as e:
     raise RuntimeError(f"Erro ao decodificar JSON das credenciais do GCS: {e}")
 
-# Conecta ao bucket
-try:
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
-except Exception as e:
-    raise RuntimeError(f"Erro ao conectar ao bucket '{GCS_BUCKET_NAME}': {e}")
+def get_bucket(tipo="logos"):
+    if tipo == "conteudo":
+        bucket_name = GCS_BUCKET_CONTEUDO
+    else:
+        bucket_name = GCS_BUCKET_LOGOS
+    if not bucket_name:
+        raise RuntimeError(f"Bucket para tipo '{tipo}' não configurado.")
+    return storage_client.bucket(bucket_name)
 
-
-def upload_image_to_gcs(local_path, filename):
+def upload_image_to_gcs(local_path, filename, tipo="logos"):
     """
-    Faz o upload de um arquivo local para o Google Cloud Storage.
+    Faz o upload de um arquivo local para o Google Cloud Storage no bucket correto.
     """
+    bucket = get_bucket(tipo)
     blob = bucket.blob(filename)
     blob.upload_from_filename(local_path)
-    # Retorna o URL do Google Cloud Storage
     gcs_url = f"gs://{bucket.name}/{filename}"
     return gcs_url
+
+def get_bucket(tipo="logos"):
+    from google.cloud import storage
+    if tipo == "conteudo":
+        bucket_name = os.getenv("GCS_BUCKET_CONTEUDO")
+    else:
+        bucket_name = os.getenv("GCS_BUCKET_LOGOS")
+    return storage_client.bucket(bucket_name)
