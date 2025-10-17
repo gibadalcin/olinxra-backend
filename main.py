@@ -4,6 +4,9 @@ import json
 import os
 import numpy as np
 import firebase_admin
+import httpx
+import tempfile
+import smtplib
 from fastapi import Request
 from firebase_admin import credentials, auth
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Form, Query, Body, Security
@@ -17,14 +20,11 @@ from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs, get_bucket
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
-import tempfile
-import smtplib
 from email.mime.text import MIMEText
 import asyncio
 import onnxruntime as ort
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
-import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 load_dotenv()
@@ -178,7 +178,8 @@ async def _search_and_compare_logic(file: UploadFile):
             temp_file.write(contents)
             temp_path = temp_file.name
 
-        query_vector = extract_clip_features(temp_path, ort_session)
+        # heavy CPU work: run in threadpool to avoid blocking event loop
+        query_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
         import numpy as np
         print("query_vector shape:", np.array(query_vector).shape)
         print("query_vector values:", np.array(query_vector).tolist())
@@ -258,10 +259,12 @@ async def add_logo(
             contents = await file.read()
             temp_file.write(contents)
             temp_path = temp_file.name
-        features = extract_clip_features(temp_path, ort_session)
+        # Extrai features em threadpool para não bloquear o event loop
+        features = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
         features = np.array(features, dtype=np.float32)
         features /= np.linalg.norm(features)
-        gcs_url = upload_image_to_gcs(temp_path, os.path.basename(file.filename))
+        # Upload ao GCS pode envolver I/O síncrono; executa em threadpool também
+        gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, os.path.basename(file.filename))
         doc = {
             "nome": name,
             "url": gcs_url,
@@ -430,9 +433,13 @@ async def geocode_reverse(lat, lon):
         "addressdetails": 1
     }
     headers = {"User-Agent": "OlinxRA/1.0"}
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code == 200:
-        return response.json().get("address", {})
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url, params=params, headers=headers)
+        if response.status_code == 200:
+            return response.json().get("address", {})
+    except httpx.RequestError as e:
+        logging.error(f"Erro na chamada de geocode_reverse: {e}")
     return {}
 
 @app.get('/api/reverse-geocode')
