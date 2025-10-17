@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
-from gcs_utils import upload_image_to_gcs
+from gcs_utils import upload_image_to_gcs, get_bucket
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
 import tempfile
