@@ -642,19 +642,39 @@ async def post_conteudo(
             return { 'action': 'deleted' }
 
         # Caso contrário, cria ou atualiza (upsert)
-        doc = {
-            **filtro,
-            'blocos': blocos,
-            'latitude': latitude,
-            'longitude': longitude,
-            'tipo_regiao': tipo_regiao,
-            'nome_regiao': nome_regiao,
-            'updated_at': str(datetime.utcnow())
-        }
+        # Implementação B: não deduplicar blocos por filename. Quando existir documento,
+        # concatenamos os blocos recebidos ao array existente (permitindo múltiplos blocos
+        # que referenciem o mesmo arquivo). Isso preserva o reuso do arquivo no storage
+        # mas garante que cada bloco enviado gere uma entrada no documento.
         if existente:
-            await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': doc})
-            return { 'action': 'saved' }
+            try:
+                existing_bloques = existente.get('blocos', []) or []
+                # concatena mantendo a ordem: blocos já existentes primeiro, depois os novos
+                merged_bloques = list(existing_bloques) + list(blocos)
+                update_doc = {
+                    **filtro,
+                    'blocos': merged_bloques,
+                    'latitude': latitude,
+                    'longitude': longitude,
+                    'tipo_regiao': tipo_regiao,
+                    'nome_regiao': nome_regiao,
+                    'updated_at': str(datetime.utcnow())
+                }
+                await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': update_doc})
+                return { 'action': 'saved' }
+            except Exception as e:
+                logging.exception('Erro ao mesclar blocos existentes')
+                raise HTTPException(status_code=500, detail=f'Erro ao salvar conteúdo: {str(e)}')
         else:
+            doc = {
+                **filtro,
+                'blocos': blocos,
+                'latitude': latitude,
+                'longitude': longitude,
+                'tipo_regiao': tipo_regiao,
+                'nome_regiao': nome_regiao,
+                'updated_at': str(datetime.utcnow())
+            }
             await db['conteudos'].insert_one(doc)
             return { 'action': 'saved' }
     except HTTPException:
@@ -716,17 +736,13 @@ async def add_content_image(
         }
         bloco_return = None
         if conteudo_doc:
-            # Só adiciona se não existir bloco com mesmo filename
-            blocos = conteudo_doc.get("blocos", [])
-            if not any(b.get("filename") == bloco_img["filename"] for b in blocos):
-                await db["conteudos"].update_one(
-                    filtro,
-                    {"$push": {"blocos": bloco_img}}
-                )
-                bloco_return = bloco_img
-            else:
-                # retorna o bloco existente
-                bloco_return = next((b for b in blocos if b.get("filename") == bloco_img["filename"]), bloco_img)
+            # Adiciona o bloco independentemente de duplicatas para permitir
+            # itens idênticos em carousels ou múltiplos blocos com mesmo arquivo
+            await db["conteudos"].update_one(
+                filtro,
+                {"$push": {"blocos": bloco_img}}
+            )
+            bloco_return = bloco_img
             conteudo_id = str(conteudo_doc["_id"])
         else:
             # Cria novo documento de conteúdo
