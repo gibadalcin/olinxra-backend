@@ -594,6 +594,76 @@ async def get_conteudo_por_regiao(
     return {"blocos": []}
 
 
+@app.post('/api/conteudo')
+async def post_conteudo(
+    payload: dict = Body(...),
+    token: dict = Depends(verify_firebase_token_dep)
+):
+    """Cria ou atualiza um documento de conteúdo para uma marca/região.
+    Espera payload com: nome_marca, blocos (array), latitude, longitude, tipo_regiao, nome_regiao
+    Se blocos estiver vazio e documento existir, remove o documento (action: deleted).
+    Retorna { action: 'saved' } ou { action: 'deleted' }.
+    """
+    try:
+        nome_marca = payload.get('nome_marca')
+        blocos = payload.get('blocos', []) or []
+        latitude = payload.get('latitude')
+        longitude = payload.get('longitude')
+        tipo_regiao = payload.get('tipo_regiao')
+        nome_regiao = payload.get('nome_regiao')
+
+        if not nome_marca:
+            raise HTTPException(status_code=422, detail="Campo 'nome_marca' é obrigatório.")
+
+        filtro = {
+            'nome_marca': nome_marca,
+            'owner_uid': token.get('uid')
+        }
+
+        existente = await db['conteudos'].find_one(filtro)
+
+        # Validar se há URLs locais (blob:) que indicam upload não finalizado
+        invalid_blocks = []
+        for idx, b in enumerate(blocos):
+            try:
+                u = b.get('url', '') if isinstance(b, dict) else ''
+                c = b.get('conteudo', '') if isinstance(b, dict) else ''
+                if (isinstance(u, str) and u.startswith('blob:')) or (isinstance(c, str) and c.startswith('blob:')):
+                    invalid_blocks.append({ 'index': idx, 'filename': (b.get('filename') or b.get('nome') or '') if isinstance(b, dict) else '' })
+            except Exception:
+                continue
+        if invalid_blocks:
+            logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
+            raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
+
+        # Se blocos estiverem vazios e já existe documento -> deletar
+        if existente and (not isinstance(blocos, list) or len(blocos) == 0):
+            await db['conteudos'].delete_one({'_id': existente['_id']})
+            return { 'action': 'deleted' }
+
+        # Caso contrário, cria ou atualiza (upsert)
+        doc = {
+            **filtro,
+            'blocos': blocos,
+            'latitude': latitude,
+            'longitude': longitude,
+            'tipo_regiao': tipo_regiao,
+            'nome_regiao': nome_regiao,
+            'updated_at': str(datetime.utcnow())
+        }
+        if existente:
+            await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': doc})
+            return { 'action': 'saved' }
+        else:
+            await db['conteudos'].insert_one(doc)
+            return { 'action': 'saved' }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception('Erro ao salvar conteúdo')
+        raise HTTPException(status_code=500, detail=f'Erro ao salvar conteúdo: {str(e)}')
+
+
 @app.post('/add-content-image/')
 async def add_content_image(
     file: UploadFile = File(...),
