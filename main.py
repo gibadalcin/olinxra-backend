@@ -725,40 +725,24 @@ async def add_content_image(
             "nome_regiao": nome_regiao,
             "owner_uid": token["uid"]
         }
-        conteudo_doc = await db["conteudos"].find_one(filtro)
+        # Não gravar automaticamente no MongoDB aqui: somente retornar metadados do upload
         bloco_img = {
             "tipo": tipo_bloco,
             "subtipo": subtipo,
             "url": gcs_url,
             "nome": name,
             "filename": gcs_filename,
-            "type": file.content_type
+            "type": file.content_type,
+            "created_at": str(datetime.utcnow())
         }
-        bloco_return = None
-        if conteudo_doc:
-            # Adiciona o bloco independentemente de duplicatas para permitir
-            # itens idênticos em carousels ou múltiplos blocos com mesmo arquivo
-            await db["conteudos"].update_one(
-                filtro,
-                {"$push": {"blocos": bloco_img}}
-            )
-            bloco_return = bloco_img
-            conteudo_id = str(conteudo_doc["_id"])
-        else:
-            # Cria novo documento de conteúdo
-            novo_doc = {
-                **filtro,
-                "blocos": [bloco_img],
-                "created_at": str(datetime.utcnow())
-            }
-            result = await db["conteudos"].insert_one(novo_doc)
-            conteudo_id = str(result.inserted_id)
-            bloco_return = bloco_img
+        # Gera signed_url para facilitar preview imediato no frontend (se possível)
+        try:
+            signed = gerar_signed_url_conteudo(gcs_url, gcs_filename)
+        except Exception:
+            signed = gcs_url
         t3 = time.time()
-        logging.info(f"[add_content_image] Tempo MongoDB: {t3-t2:.2f}s (total: {t3-t0:.2f}s)")
-
-        # Retorna o bloco criado/atualizado como autoridade para o frontend
-        return {"success": True, "conteudo_id": conteudo_id, "url": gcs_url, "bloco": bloco_return}
+        logging.info(f"[add_content_image] Upload concluído (não persiste no DB). Tempo total: {t3-t0:.2f}s")
+        return {"success": True, "url": gcs_url, "signed_url": signed, "bloco": bloco_img}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
     finally:
