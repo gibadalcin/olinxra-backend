@@ -621,10 +621,10 @@ async def add_content_image(
             temp_path = temp_file.name
         t1 = time.time()
         logging.info(f"[add_content_image] Tempo até upload GCS: {t1-t0:.2f}s")
-    # Salva no bucket olinxra-conteudo, organizado por admin
-    gcs_filename = f"{token['uid']}/{name_base}{ext}"
-    # upload síncrono -> execute em threadpool para não bloquear o loop
-    gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, gcs_filename, "conteudo")
+        # Salva no bucket olinxra-conteudo, organizado por admin
+        gcs_filename = f"{token['uid']}/{name_base}{ext}"
+        # upload síncrono -> execute em threadpool para não bloquear o loop
+        gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, gcs_filename, "conteudo")
         t2 = time.time()
         logging.info(f"[add_content_image] Tempo upload GCS: {t2-t1:.2f}s (total: {t2-t0:.2f}s)")
 
@@ -670,8 +670,9 @@ async def add_content_image(
             bloco_return = bloco_img
         t3 = time.time()
         logging.info(f"[add_content_image] Tempo MongoDB: {t3-t2:.2f}s (total: {t3-t0:.2f}s)")
-    # Retorna o bloco criado/atualizado como autoridade para o frontend
-    return {"success": True, "conteudo_id": conteudo_id, "url": gcs_url, "bloco": bloco_return}
+
+        # Retorna o bloco criado/atualizado como autoridade para o frontend
+        return {"success": True, "conteudo_id": conteudo_id, "url": gcs_url, "bloco": bloco_return}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
     finally:
