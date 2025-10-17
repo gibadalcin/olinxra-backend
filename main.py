@@ -621,9 +621,10 @@ async def add_content_image(
             temp_path = temp_file.name
         t1 = time.time()
         logging.info(f"[add_content_image] Tempo até upload GCS: {t1-t0:.2f}s")
-        # Salva no bucket olinxra-conteudo, organizado por admin
-        gcs_filename = f"{token['uid']}/{name_base}{ext}"
-        gcs_url = upload_image_to_gcs(temp_path, gcs_filename, tipo="conteudo")
+    # Salva no bucket olinxra-conteudo, organizado por admin
+    gcs_filename = f"{token['uid']}/{name_base}{ext}"
+    # upload síncrono -> execute em threadpool para não bloquear o loop
+    gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, gcs_filename, "conteudo")
         t2 = time.time()
         logging.info(f"[add_content_image] Tempo upload GCS: {t2-t1:.2f}s (total: {t2-t0:.2f}s)")
 
@@ -643,6 +644,7 @@ async def add_content_image(
             "filename": gcs_filename,
             "type": file.content_type
         }
+        bloco_return = None
         if conteudo_doc:
             # Só adiciona se não existir bloco com mesmo filename
             blocos = conteudo_doc.get("blocos", [])
@@ -651,6 +653,10 @@ async def add_content_image(
                     filtro,
                     {"$push": {"blocos": bloco_img}}
                 )
+                bloco_return = bloco_img
+            else:
+                # retorna o bloco existente
+                bloco_return = next((b for b in blocos if b.get("filename") == bloco_img["filename"]), bloco_img)
             conteudo_id = str(conteudo_doc["_id"])
         else:
             # Cria novo documento de conteúdo
@@ -661,9 +667,11 @@ async def add_content_image(
             }
             result = await db["conteudos"].insert_one(novo_doc)
             conteudo_id = str(result.inserted_id)
+            bloco_return = bloco_img
         t3 = time.time()
         logging.info(f"[add_content_image] Tempo MongoDB: {t3-t2:.2f}s (total: {t3-t0:.2f}s)")
-        return {"success": True, "conteudo_id": conteudo_id, "url": gcs_url}
+    # Retorna o bloco criado/atualizado como autoridade para o frontend
+    return {"success": True, "conteudo_id": conteudo_id, "url": gcs_url, "bloco": bloco_return}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
     finally:
