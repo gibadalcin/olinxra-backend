@@ -923,57 +923,74 @@ async def post_conteudo(
                 b.pop('signed_url', None)
 
             cleaned_blocos.append(b)
-        # Pós-processamento: se algum bloco de mídia foi salvo sem 'url' mas tem 'filename',
-        # aponte o campo 'url' para o caminho gs://olinxra-conteudo/{filename} para facilitar previews.
+        # Pós-processamento consolidado: para cada bloco, garantir propriedades derivadas
         for b in cleaned_blocos:
-                try:
-                    tipo_selecionado = b.get('tipoSelecionado') or ''
-                    tipo_label = b.get('tipo') or ''
-                    is_media = False
-                    if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+            try:
+                tipo_selecionado = b.get('tipoSelecionado') or ''
+                tipo_label = b.get('tipo') or ''
+                is_media = False
+                if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+                    is_media = True
+                else:
+                    tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
+                    if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
                         is_media = True
+                if not is_media and bloco_possui_media(b):
+                    is_media = True
+
+                # If media and missing url but has filename -> set url
+                if is_media and (not b.get('url')) and b.get('filename'):
+                    filename = b.get('filename')
+                    if not str(filename).startswith('gs://'):
+                        b['url'] = f"gs://olinxra-conteudo/{filename}"
+
+                # If this is a carousel (has items), persist tipoSelecionado and normalize items
+                if b.get('items') and isinstance(b.get('items'), list) and len(b.get('items')) > 0:
+                    if not b.get('tipoSelecionado'):
+                        b['tipoSelecionado'] = 'carousel'
+                    for it in b['items']:
+                        try:
+                            if it is None:
+                                continue
+                            ca = it.get('created_at')
+                            if isinstance(ca, str):
+                                try:
+                                    it['created_at'] = datetime.fromisoformat(ca)
+                                except Exception:
+                                    try:
+                                        it['created_at'] = datetime.strptime(ca, "%Y-%m-%dT%H:%M:%S.%f")
+                                    except Exception:
+                                        try:
+                                            it['created_at'] = datetime.strptime(ca, "%Y-%m-%d %H:%M:%S.%f")
+                                        except Exception:
+                                            it['created_at'] = datetime.utcnow()
+                            elif ca is None:
+                                it['created_at'] = datetime.utcnow()
+                        except Exception:
+                            it['created_at'] = datetime.utcnow()
+                    # remove empty/blank parent media-like fields
+                    for key in ('url', 'filename', 'nome', 'type'):
+                        try:
+                            val = b.get(key)
+                            if val is None or (isinstance(val, str) and val.strip() == ''):
+                                b.pop(key, None)
+                        except Exception:
+                            pass
+
+                # If media and missing filename but has nome, infer filename using owner uid
+                if is_media and (not b.get('filename')) and b.get('nome'):
+                    nome = str(b.get('nome'))
+                    if '/' in nome:
+                        filename = nome
                     else:
-                        tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
-                        if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
-                            is_media = True
-                    # detect by fields as well
-                    if not is_media and bloco_possui_media(b):
-                        is_media = True
-                    if is_media and (not b.get('url')) and b.get('filename'):
-                        # assume content bucket
-                        filename = b.get('filename')
-                        # if filename already contains bucket prefix, keep as-is
-                        if not str(filename).startswith('gs://'):
-                            b['url'] = f"gs://olinxra-conteudo/{filename}"
-                except Exception:
-                    pass
-        # Safety: if a media bloco lacks 'filename' but has 'nome', infer filename using owner uid
-        for b in cleaned_blocos:
-                try:
-                    tipo_selecionado = b.get('tipoSelecionado') or ''
-                    tipo_label = b.get('tipo') or ''
-                    is_media = False
-                    if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
-                        is_media = True
-                    else:
-                        tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
-                        if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
-                            is_media = True
-                    if not is_media and bloco_possui_media(b):
-                        is_media = True
-                    if is_media and (not b.get('filename')) and b.get('nome'):
-                        nome = str(b.get('nome'))
-                        # If nome already contains path segments, try to use it as filename; otherwise prefix with owner uid
-                        if '/' in nome:
-                            filename = nome
-                        else:
-                            owner = token.get('uid') or 'unknown'
-                            filename = f"{owner}/{nome}"
-                        b['filename'] = filename
-                        if not b.get('url'):
-                            b['url'] = f"gs://olinxra-conteudo/{filename}"
-                except Exception:
-                    pass
+                        owner = token.get('uid') or 'unknown'
+                        filename = f"{owner}/{nome}"
+                    b['filename'] = filename
+                    if not b.get('url'):
+                        b['url'] = f"gs://olinxra-conteudo/{filename}"
+            except Exception:
+                # keep going; post-processing must not fail the whole request
+                pass
         if invalid_blocks:
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
@@ -1040,7 +1057,8 @@ async def post_conteudo(
                         continue
 
                 await db['conteudos'].delete_one({'_id': existente['_id']})
-                logging.info(f"[post_conteudo] Documento {_id if (exists := existente.get('_id')) is None else str(exists)} deletado (blocos vazios)")
+                exists_id = existente.get('_id')
+                logging.info(f"[post_conteudo] Documento {str(exists_id) if exists_id is not None else 'unknown'} deletado (blocos vazios)")
             except Exception as e:
                 logging.exception('Erro ao deletar documento existente com blocos vazios')
                 raise HTTPException(status_code=500, detail=f'Erro ao deletação: {str(e)}')
