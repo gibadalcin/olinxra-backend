@@ -1228,6 +1228,11 @@ async def add_content_image(
         origin = Request.scope.get('headers') if False else None
     except Exception:
         origin = None
+    # DEBUG: log minimal info about incoming request to help diagnose 422 errors
+    try:
+        logging.info(f"[add_content_image] recebendo upload: filename={getattr(file, 'filename', None)} content_type={getattr(file, 'content_type', None)} name_param={name} temp_id={temp_id} tipo_bloco={tipo_bloco} subtipo={subtipo} marca={marca} tipo_regiao={tipo_regiao} nome_regiao={nome_regiao} uid={token.get('uid') if token else 'no-token'}")
+    except Exception:
+        logging.exception('[add_content_image] falha ao logar metadados iniciais do upload')
     # Nota: a checagem de Origin será feita manualmente abaixo através do header
     # Valida content-type genericamente: aceitar image/* e video/*
     if not (file.content_type and (file.content_type.startswith('image/') or file.content_type.startswith('video/'))):
