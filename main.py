@@ -766,7 +766,8 @@ async def get_conteudo_por_regiao(
 @app.post('/api/conteudo')
 async def post_conteudo(
     payload: dict = Body(...),
-    token: dict = Depends(verify_firebase_token_dep)
+    token: dict = Depends(verify_firebase_token_dep),
+    dry_run: bool = Query(False)
 ):
     """Cria ou atualiza um documento de conteúdo para uma marca/região.
     Espera payload com: nome_marca, blocos (array), latitude, longitude, tipo_regiao, nome_regiao
@@ -937,7 +938,65 @@ async def post_conteudo(
 
         # Se blocos estiverem vazios e já existe documento -> deletar (com confirmação)
         if existente and (not isinstance(cleaned_blocos, list) or len(cleaned_blocos) == 0):
+            # compute files to delete (do not delete yet if dry_run)
+            old_blocos = existente.get('blocos', []) or []
+            to_delete = []
+            for ob in old_blocos:
+                try:
+                    if ob.get('items') and isinstance(ob.get('items'), list):
+                        for it in ob.get('items'):
+                            if it:
+                                url = it.get('url')
+                                fname = it.get('filename') or it.get('nome')
+                                if url:
+                                    to_delete.append({'gs_url': url, 'tipo': 'conteudo'})
+                                elif fname:
+                                    to_delete.append({'filename': fname, 'tipo': 'conteudo'})
+                    else:
+                        url = ob.get('url')
+                        fname = ob.get('filename') or ob.get('nome')
+                        if url:
+                            to_delete.append({'gs_url': url, 'tipo': 'conteudo'})
+                        elif fname:
+                            to_delete.append({'filename': fname, 'tipo': 'conteudo'})
+                except Exception:
+                    continue
+
+            if dry_run:
+                return {'action': 'dry_run', 'to_delete': to_delete, 'blocos': []}
+
+            # enqueue deletions and attempt immediate delete; then remove document
             try:
+                from gcs_utils import delete_gs_path, delete_file
+                for item in to_delete:
+                    try:
+                        # insert pending_deletes entry
+                        pend = {
+                            'gs_url': item.get('gs_url'),
+                            'filename': item.get('filename'),
+                            'tipo': item.get('tipo', 'conteudo'),
+                            'status': 'pending',
+                            'retries': 0,
+                            'created_at': datetime.utcnow(),
+                            'last_attempt': None
+                        }
+                        res = await db['pending_deletes'].insert_one(pend)
+                        # attempt immediate deletion in thread
+                        def try_del():
+                            try:
+                                if item.get('gs_url'):
+                                    return delete_gs_path(item.get('gs_url'))
+                                elif item.get('filename'):
+                                    return delete_file(item.get('filename'), item.get('tipo', 'conteudo'))
+                            except Exception:
+                                return False
+                            return False
+                        ok = await asyncio.to_thread(try_del)
+                        if ok:
+                            await db['pending_deletes'].update_one({'_id': res.inserted_id}, {'$set': {'status': 'done', 'last_attempt': datetime.utcnow()}})
+                    except Exception:
+                        continue
+
                 await db['conteudos'].delete_one({'_id': existente['_id']})
                 logging.info(f"[post_conteudo] Documento {_id if (exists := existente.get('_id')) is None else str(exists)} deletado (blocos vazios)")
             except Exception as e:
@@ -967,6 +1026,78 @@ async def post_conteudo(
                     'nome_marca': nome_marca,
                     'updated_at': datetime.utcnow()
                 }
+                # Before updating, determine which files were removed and delete them from GCS
+                try:
+                    old_blocos = existente.get('blocos', []) or []
+                    # build set of filenames/urls that will remain
+                    new_urls = set()
+                    new_filenames = set()
+                    for nb in cleaned_blocos:
+                        if nb.get('items') and isinstance(nb.get('items'), list):
+                            for it in nb['items']:
+                                if it:
+                                    if it.get('url'): new_urls.add(str(it.get('url')))
+                                    if it.get('filename'): new_filenames.add(str(it.get('filename')))
+                        else:
+                            if nb.get('url'): new_urls.add(str(nb.get('url')))
+                            if nb.get('filename'): new_filenames.add(str(nb.get('filename')))
+
+                    # iterate old blocos and enqueue files not present in new sets
+                    to_delete = []
+                    for ob in old_blocos:
+                        try:
+                            if ob.get('items') and isinstance(ob.get('items'), list):
+                                for it in ob.get('items'):
+                                    if it:
+                                        url = it.get('url')
+                                        fname = it.get('filename') or it.get('nome')
+                                        if url and url not in new_urls:
+                                            to_delete.append({'gs_url': url, 'tipo': 'conteudo'})
+                                        elif fname and fname not in new_filenames:
+                                            to_delete.append({'filename': fname, 'tipo': 'conteudo'})
+                            else:
+                                url = ob.get('url')
+                                fname = ob.get('filename') or ob.get('nome')
+                                if url and url not in new_urls:
+                                    to_delete.append({'gs_url': url, 'tipo': 'conteudo'})
+                                elif fname and fname not in new_filenames:
+                                    to_delete.append({'filename': fname, 'tipo': 'conteudo'})
+                        except Exception:
+                            continue
+
+                    if dry_run:
+                        return {'action': 'dry_run', 'to_delete': to_delete, 'blocos': cleaned_blocos}
+
+                    from gcs_utils import delete_gs_path, delete_file
+                    for item in to_delete:
+                        try:
+                            pend = {
+                                'gs_url': item.get('gs_url'),
+                                'filename': item.get('filename'),
+                                'tipo': item.get('tipo', 'conteudo'),
+                                'status': 'pending',
+                                'retries': 0,
+                                'created_at': datetime.utcnow(),
+                                'last_attempt': None
+                            }
+                            res = await db['pending_deletes'].insert_one(pend)
+                            def try_del():
+                                try:
+                                    if item.get('gs_url'):
+                                        return delete_gs_path(item.get('gs_url'))
+                                    elif item.get('filename'):
+                                        return delete_file(item.get('filename'), item.get('tipo', 'conteudo'))
+                                except Exception:
+                                    return False
+                                return False
+                            ok = await asyncio.to_thread(try_del)
+                            if ok:
+                                await db['pending_deletes'].update_one({'_id': res.inserted_id}, {'$set': {'status': 'done', 'last_attempt': datetime.utcnow()}})
+                        except Exception:
+                            continue
+                except Exception:
+                    logging.exception('[post_conteudo] Falha ao tentar enfileirar/remover arquivos antigos do GCS antes do update')
+
                 await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': update_doc})
                 # Recupera o documento atualizado para retornar os blocos persistidos
                 saved = await db['conteudos'].find_one({'_id': existente['_id']})
@@ -1003,6 +1134,38 @@ async def post_conteudo(
     except Exception as e:
         logging.exception('Erro ao salvar conteúdo')
         raise HTTPException(status_code=500, detail=f'Erro ao salvar conteúdo: {str(e)}')
+
+
+@app.post('/admin/process-pending-deletes')
+async def admin_process_pending_deletes(token: dict = Depends(verify_firebase_token_dep)):
+    # Only allow master admin to trigger
+    master_email = os.getenv('USER_ADMIN_EMAIL')
+    if token.get('email') != master_email:
+        raise HTTPException(status_code=403, detail='Forbidden')
+    # process pending deletes (simple synchronous attempt)
+    pending = await db['pending_deletes'].find({'status': {'$in': ['pending', 'retry']}}).to_list(length=1000)
+    processed = []
+    from gcs_utils import delete_gs_path, delete_file
+    for p in pending:
+        try:
+            ok = False
+            if p.get('gs_url'):
+                ok = await asyncio.to_thread(delete_gs_path, p.get('gs_url'))
+            elif p.get('filename'):
+                ok = await asyncio.to_thread(delete_file, p.get('filename'), p.get('tipo', 'conteudo'))
+            if ok:
+                await db['pending_deletes'].update_one({'_id': p['_id']}, {'$set': {'status': 'done', 'last_attempt': datetime.utcnow()}})
+                processed.append({'id': str(p['_id']), 'status': 'done'})
+            else:
+                await db['pending_deletes'].update_one({'_id': p['_id']}, {'$set': {'status': 'retry', 'last_attempt': datetime.utcnow()}, '$inc': {'retries': 1}})
+                processed.append({'id': str(p['_id']), 'status': 'retry'})
+        except Exception:
+            try:
+                await db['pending_deletes'].update_one({'_id': p['_id']}, {'$set': {'status': 'error', 'last_attempt': datetime.utcnow()}, '$inc': {'retries': 1}})
+            except Exception:
+                pass
+            processed.append({'id': str(p['_id']), 'status': 'error'})
+    return {'processed': processed, 'count': len(processed)}
 
 
 @app.post('/add-content-image/')
