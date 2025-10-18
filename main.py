@@ -437,11 +437,67 @@ async def debug_inspect_request(data: dict = Body(...)):
     return {"received": data}
 
 async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude):
-    return await db["conteudos"].find_one({
-        "marca_id": str(marca_id),
-        "latitude": {"$gte": latitude - 0.01, "$lte": latitude + 0.01},
-        "longitude": {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
-    })
+    """
+    Procura um documento de conteúdo pela marca (preferencialmente por marca_id) e
+    por faixa de latitude/longitude.
+
+    Estratégia:
+    1. Tenta buscar por campo `marca_id` igual a `str(marca_id)`.
+    2. Se não encontrar, tenta resolver o `nome_marca` usando a coleção `logos`
+       (caso `marca_id` seja um ObjectId vindo de `logos`) e busca por `nome_marca`.
+    3. Por fim, tenta um fallback simples por `nome_marca` igual a `str(marca_id)`.
+    Isso garante compatibilidade com documentos antigos que usam `nome_marca` e com
+    novos documentos que usam `marca_id`.
+    """
+    lat_filter = {"$gte": latitude - 0.01, "$lte": latitude + 0.01}
+    lon_filter = {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
+
+    # 1) Busca por marca_id
+    try:
+        filtro = {
+            "marca_id": str(marca_id),
+            "latitude": lat_filter,
+            "longitude": lon_filter
+        }
+        doc = await db["conteudos"].find_one(filtro)
+        if doc:
+            return doc
+    except Exception:
+        # falha ao buscar por marca_id — seguimos com fallbacks
+        doc = None
+
+    # 2) Tentar resolver nome da marca a partir da coleção `logos`
+    nome_marca = None
+    try:
+        # Se marca_id for um ObjectId ou string que represente o _id
+        try:
+            obj_id = ObjectId(marca_id)
+            marca_doc = await logos_collection.find_one({"_id": obj_id})
+        except Exception:
+            # marca_id pode já ser um nome ou um string não-convertível
+            marca_doc = None
+        if marca_doc:
+            nome_marca = marca_doc.get("nome")
+    except Exception:
+        nome_marca = None
+
+    if nome_marca:
+        filtro2 = {
+            "nome_marca": nome_marca,
+            "latitude": lat_filter,
+            "longitude": lon_filter
+        }
+        doc = await db["conteudos"].find_one(filtro2)
+        if doc:
+            return doc
+
+    # 3) Fallback: busca por nome_marca igual ao valor recebido
+    filtro3 = {
+        "nome_marca": str(marca_id),
+        "latitude": lat_filter,
+        "longitude": lon_filter
+    }
+    return await db["conteudos"].find_one(filtro3)
 
 async def geocode_reverse(lat, lon):
     url = "https://nominatim.openstreetmap.org/reverse"
@@ -634,10 +690,25 @@ async def post_conteudo(
         if not nome_marca:
             raise HTTPException(status_code=422, detail="Campo 'nome_marca' é obrigatório.")
 
+        # Tentar resolver marca para obter um marca_id estável
+        marca_doc = await logos_collection.find_one({"nome": nome_marca})
+        marca_id = None
+        if marca_doc and "_id" in marca_doc:
+            marca_id = str(marca_doc["_id"])
+        else:
+            logging.warning(f"[post_conteudo] Marca '{nome_marca}' não encontrada em 'logos' — salvando sem marca_id.")
+
+        # Construir filtro de upsert incluindo região — assim cada combinação
+        # (marca_id|nome_marca) + owner_uid + tipo_regiao + nome_regiao será única.
         filtro = {
-            'nome_marca': nome_marca,
-            'owner_uid': token.get('uid')
+            'owner_uid': token.get('uid'),
+            'tipo_regiao': tipo_regiao,
+            'nome_regiao': nome_regiao
         }
+        if marca_id:
+            filtro['marca_id'] = marca_id
+        else:
+            filtro['nome_marca'] = nome_marca
 
         existente = await db['conteudos'].find_one(filtro)
 
@@ -677,6 +748,8 @@ async def post_conteudo(
                     'longitude': longitude,
                     'tipo_regiao': tipo_regiao,
                     'nome_regiao': nome_regiao,
+                    'marca_id': marca_id,
+                    'nome_marca': nome_marca,
                     'updated_at': str(datetime.utcnow())
                 }
                 await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': update_doc})
@@ -692,6 +765,8 @@ async def post_conteudo(
                 'longitude': longitude,
                 'tipo_regiao': tipo_regiao,
                 'nome_regiao': nome_regiao,
+                'marca_id': marca_id,
+                'nome_marca': nome_marca,
                 'updated_at': str(datetime.utcnow())
             }
             await db['conteudos'].insert_one(doc)
