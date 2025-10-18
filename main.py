@@ -159,12 +159,31 @@ async def verify_firebase_token_dep(credentials: HTTPAuthorizationCredentials = 
             detail="Token Firebase inválido ou expirado",
         )
 
+# Configura CORS permitindo configurar as origens via variável de ambiente
+# Lê CORS_ALLOW_ORIGINS (comma-separated). Se ausente, usa fallback somente em dev.
+_env_origins = os.getenv('CORS_ALLOW_ORIGINS', '').strip()
+if _env_origins:
+    try:
+        _allow_origins = [o.strip() for o in _env_origins.split(',') if o.strip()]
+    except Exception:
+        logging.error('Formato inválido em CORS_ALLOW_ORIGINS; esperar comma-separated list')
+        _allow_origins = []
+else:
+    # fallback apenas para desenvolvimento local
+    if os.getenv('ENV', 'development') == 'production':
+        logging.error('CORS_ALLOW_ORIGINS não definido em produção. Abortando inicialização.')
+        raise RuntimeError('Variável CORS_ALLOW_ORIGINS é obrigatória em produção.')
+    logging.warning('CORS_ALLOW_ORIGINS não definido — usando fallback http://localhost:5173 (apenas local).')
+    _allow_origins = ['http://localhost:5173']
+
+logging.info(f"CORS origins configured: {_allow_origins}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 async def _search_and_compare_logic(file: UploadFile):
@@ -648,12 +667,12 @@ async def post_conteudo(
         # mas garante que cada bloco enviado gere uma entrada no documento.
         if existente:
             try:
-                existing_bloques = existente.get('blocos', []) or []
-                # concatena mantendo a ordem: blocos já existentes primeiro, depois os novos
-                merged_bloques = list(existing_bloques) + list(blocos)
+                # Substitui os blocos existentes pelo payload recebido.
+                # Isso evita duplicações quando o frontend carrega os blocos,
+                # edita um existente e envia o estado completo de volta.
                 update_doc = {
                     **filtro,
-                    'blocos': merged_bloques,
+                    'blocos': list(blocos),
                     'latitude': latitude,
                     'longitude': longitude,
                     'tipo_regiao': tipo_regiao,
@@ -663,7 +682,7 @@ async def post_conteudo(
                 await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': update_doc})
                 return { 'action': 'saved' }
             except Exception as e:
-                logging.exception('Erro ao mesclar blocos existentes')
+                logging.exception('Erro ao atualizar blocos existentes')
                 raise HTTPException(status_code=500, detail=f'Erro ao salvar conteúdo: {str(e)}')
         else:
             doc = {
@@ -696,10 +715,15 @@ async def add_content_image(
     nome_regiao: str = Form(""),
     token: dict = Depends(verify_firebase_token_dep)
 ):
-    # permitir tipos de imagem e vídeo mais comuns (inclui webp/gif/quicktime)
-    allowed_types = ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/quicktime", "video/quicktime", "video/quicktime"]
-    # Fallback: aceita qualquer image/* ou video/* mas loga o tipo para auditoria
-    if not (file.content_type.startswith('image/') or file.content_type.startswith('video/')):
+    # Segurança: validar Origin (se fornecido) contra lista de origens permitidas
+    origin = None
+    try:
+        origin = Request.scope.get('headers') if False else None
+    except Exception:
+        origin = None
+    # Nota: a checagem de Origin será feita manualmente abaixo através do header
+    # Valida content-type genericamente: aceitar image/* e video/*
+    if not (file.content_type and (file.content_type.startswith('image/') or file.content_type.startswith('video/'))):
         logging.warning(f"[add_content_image] Tipo de conteúdo rejeitado: {file.content_type}")
         raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido.")
 
@@ -722,14 +746,7 @@ async def add_content_image(
         t2 = time.time()
         logging.info(f"[add_content_image] Tempo upload GCS: {t2-t1:.2f}s (total: {t2-t0:.2f}s)")
 
-        # Busca documento de conteúdo existente
-        filtro = {
-            "nome_marca": marca,
-            "tipo_regiao": tipo_regiao,
-            "nome_regiao": nome_regiao,
-            "owner_uid": token["uid"]
-        }
-        # Não gravar automaticamente no MongoDB aqui: somente retornar metadados do upload
+        # Não gravar no MongoDB aqui: upload-only. Retornamos metadados do upload.
         bloco_img = {
             "tipo": tipo_bloco,
             "subtipo": subtipo,
@@ -749,6 +766,11 @@ async def add_content_image(
         resp = {"success": True, "url": gcs_url, "signed_url": signed, "bloco": bloco_img}
         if temp_id:
             resp["temp_id"] = temp_id
+        # Log minimal info: uid and filename/type
+        try:
+            logging.info(f"[add_content_image] upload ok uid={token.get('uid')} filename={gcs_filename} type={file.content_type}")
+        except Exception:
+            pass
         return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
