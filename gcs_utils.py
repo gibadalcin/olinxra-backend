@@ -77,3 +77,55 @@ def upload_image_to_gcs(local_path, filename, tipo):
     gcs_url = f"gs://{bucket.name}/{filename}"
     return gcs_url
 
+
+def delete_file(filename, tipo="conteudo"):
+    """
+    Delete a file from the given bucket by its filename (path inside the bucket).
+    Returns True if deleted or False if an error occurred.
+    """
+    if not filename:
+        return False
+    bucket = get_bucket(tipo)
+    try:
+        # Normalize filename: if given a gs:// path, extract the filename part
+        if isinstance(filename, str) and filename.startswith('gs://'):
+            # remove gs://bucketname/
+            parts = filename.split('/', 3)
+            if len(parts) >= 4:
+                filename = parts[3]
+            else:
+                # fallback: last segment
+                filename = filename.split('/')[-1]
+        blob = bucket.blob(filename)
+        blob.delete()
+        try:
+            print(f"[gcs_utils] Deleted file '{filename}' from bucket '{bucket.name}'")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        try:
+            print(f"[gcs_utils] Failed to delete '{filename}' from bucket '{bucket.name}': {e}")
+        except Exception:
+            pass
+        return False
+
+
+def delete_gs_path(gs_url):
+    """
+    Convenience: delete using a gs:// URL. Detects bucket name and delegates to delete_file.
+    """
+    if not gs_url or not isinstance(gs_url, str):
+        return False
+    if gs_url.startswith('gs://'):
+        # gs://bucket-name/path/to/file
+        try:
+            without_prefix = gs_url[len('gs://'):]
+            bucket_name, _, path = without_prefix.partition('/')
+            # infer tipo from bucket name
+            tipo = 'conteudo' if 'conteudo' in bucket_name else 'logos'
+            return delete_file(path, tipo)
+        except Exception:
+            return False
+    return False
+
