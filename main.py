@@ -49,6 +49,33 @@ async def lifespan(app: FastAPI):
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     logos_collection = db["logos"]
+    # Criar índices recomendados para a coleção de conteúdos
+    try:
+        # Índice composto por marca_id + owner_uid + tipo_regiao + nome_regiao (documents com marca_id)
+        await db['conteudos'].create_index([
+            ('marca_id', 1),
+            ('owner_uid', 1),
+            ('tipo_regiao', 1),
+            ('nome_regiao', 1)
+        ], name='idx_marcaid_owner_region', sparse=True)
+
+        # Índice composto por nome_marca + owner_uid + tipo_regiao + nome_regiao (compatibilidade com docs antigos)
+        await db['conteudos'].create_index([
+            ('nome_marca', 1),
+            ('owner_uid', 1),
+            ('tipo_regiao', 1),
+            ('nome_regiao', 1)
+        ], name='idx_nomemarca_owner_region', sparse=True)
+
+        # Índice 2dsphere para consultas geoespaciais, se usarmos campo 'location'
+        await db['conteudos'].create_index([('location', '2dsphere')], name='idx_location_2dsphere')
+
+        # Índice simples por owner_uid
+        await db['conteudos'].create_index([('owner_uid', 1)], name='idx_owner_uid')
+
+        logging.info('Índices de conteúdo verificados/criados com sucesso.')
+    except Exception as e:
+        logging.exception(f'Falha ao criar índices em conteudos: {e}')
     # REMOVIDO: images_collection = db["images"]
 
     logging.info("Iniciando a aplicação...")
