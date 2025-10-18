@@ -186,6 +186,58 @@ async def verify_firebase_token_dep(credentials: HTTPAuthorizationCredentials = 
             detail="Token Firebase inválido ou expirado",
         )
 
+
+async def attach_signed_urls_to_blocos(blocos):
+    """Given a list of blocos, attach a 'signed_url' field for media blocos.
+    This runs gerar_signed_url_conteudo in a thread to avoid blocking the event loop.
+    """
+    if not blocos or not isinstance(blocos, list):
+        return blocos
+    for b in blocos:
+        try:
+            tipo_selecionado = b.get('tipoSelecionado') or ''
+            tipo_label = b.get('tipo') or ''
+            is_media = False
+            if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+                is_media = True
+            else:
+                tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
+                if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
+                    is_media = True
+            if not is_media:
+                continue
+            # For carousel, process items
+            if b.get('items') and isinstance(b.get('items'), list):
+                for it in b['items']:
+                    try:
+                        url = it.get('url') or (it.get('meta') and it['meta'].get('url'))
+                        filename = it.get('filename') or (it.get('meta') and it['meta'].get('filename'))
+                        if not url and filename:
+                            url = f"gs://olinxra-conteudo/{filename}"
+                        if url:
+                            signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, filename)
+                            if signed:
+                                it['signed_url'] = signed
+                    except Exception:
+                        continue
+                continue
+            # Single media block
+            url = b.get('url')
+            filename = b.get('filename')
+            if not url and filename:
+                url = f"gs://olinxra-conteudo/{filename}"
+            if url:
+                try:
+                    signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, filename)
+                    if signed:
+                        b['signed_url'] = signed
+                except Exception:
+                    # ignore signing failures, frontend can fallback
+                    pass
+        except Exception:
+            continue
+    return blocos
+
 # Configura CORS permitindo configurar as origens via variável de ambiente
 # Lê CORS_ALLOW_ORIGINS (comma-separated). Se ausente, usa fallback somente em dev.
 _env_origins = os.getenv('CORS_ALLOW_ORIGINS', '').strip()
@@ -660,8 +712,11 @@ async def get_conteudo(
     local_str = local_str.strip(", ").replace(",,", ",")
 
     if conteudo:
+        blocos_resp = conteudo.get("blocos", None) if conteudo.get("blocos") else None
+        if blocos_resp:
+            await attach_signed_urls_to_blocos(blocos_resp)
         resultado = {
-            "conteudo": conteudo.get("blocos", None) if conteudo.get("blocos") else None,
+            "conteudo": blocos_resp,
             "mensagem": "Conteúdo encontrado.",
             "localizacao": local_str
         }
@@ -695,8 +750,11 @@ async def get_conteudo_por_regiao(
     conteudo = await db["conteudos"].find_one(filtro)
     if conteudo:
         conteudo["_id"] = str(conteudo["_id"])
+        blocos_ret = conteudo.get("blocos", [])
+        if blocos_ret:
+            await attach_signed_urls_to_blocos(blocos_ret)
         return {
-            "blocos": conteudo.get("blocos", []),
+            "blocos": blocos_ret,
             "tipo_regiao": conteudo.get("tipo_regiao"),
             "nome_regiao": conteudo.get("nome_regiao"),
             "latitude": conteudo.get("latitude"),
@@ -799,8 +857,25 @@ async def post_conteudo(
             elif created is None:
                 b['created_at'] = datetime.utcnow()
 
-            # If block is not media, strip media fields
-            if b.get('tipo') not in ('imagem', 'carousel', 'video'):
+            # Determine whether this bloco represents media (image/carousel/video).
+            # Frontend stores a human label in 'tipo' (ex: 'Imagem topo 1') and the
+            # selected machine-friendly type in 'tipoSelecionado' (ex: 'imagem').
+            tipo_selecionado = b.get('tipoSelecionado') or ''
+            tipo_label = b.get('tipo') or ''
+            is_media = False
+            try:
+                if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+                    is_media = True
+                else:
+                    tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
+                    # Heuristic: if the label starts with 'imagem' or 'video' or 'carousel'
+                    if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
+                        is_media = True
+            except Exception:
+                is_media = False
+
+            # If not media, strip media-related fields to keep document compact.
+            if not is_media:
                 for k in ('url', 'filename', 'type', 'subtipo', 'created_at'):
                     if k in b:
                         b.pop(k, None)
@@ -810,6 +885,52 @@ async def post_conteudo(
                 b.pop('signed_url', None)
 
             cleaned_blocos.append(b)
+        # Pós-processamento: se algum bloco de mídia foi salvo sem 'url' mas tem 'filename',
+        # aponte o campo 'url' para o caminho gs://olinxra-conteudo/{filename} para facilitar previews.
+        for b in cleaned_blocos:
+            try:
+                tipo_selecionado = b.get('tipoSelecionado') or ''
+                tipo_label = b.get('tipo') or ''
+                is_media = False
+                if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+                    is_media = True
+                else:
+                    tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
+                    if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
+                        is_media = True
+                if is_media and (not b.get('url')) and b.get('filename'):
+                    # assume content bucket
+                    filename = b.get('filename')
+                    # if filename already contains bucket prefix, keep as-is
+                    if not str(filename).startswith('gs://'):
+                        b['url'] = f"gs://olinxra-conteudo/{filename}"
+            except Exception:
+                pass
+        # Safety: if a media bloco lacks 'filename' but has 'nome', infer filename using owner uid
+        for b in cleaned_blocos:
+            try:
+                tipo_selecionado = b.get('tipoSelecionado') or ''
+                tipo_label = b.get('tipo') or ''
+                is_media = False
+                if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+                    is_media = True
+                else:
+                    tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
+                    if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
+                        is_media = True
+                if is_media and (not b.get('filename')) and b.get('nome'):
+                    nome = str(b.get('nome'))
+                    # If nome already contains path segments, try to use it as filename; otherwise prefix with owner uid
+                    if '/' in nome:
+                        filename = nome
+                    else:
+                        owner = token.get('uid') or 'unknown'
+                        filename = f"{owner}/{nome}"
+                    b['filename'] = filename
+                    if not b.get('url'):
+                        b['url'] = f"gs://olinxra-conteudo/{filename}"
+            except Exception:
+                pass
         if invalid_blocks:
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
@@ -847,6 +968,12 @@ async def post_conteudo(
                     'updated_at': datetime.utcnow()
                 }
                 await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': update_doc})
+                # Recupera o documento atualizado para retornar os blocos persistidos
+                saved = await db['conteudos'].find_one({'_id': existente['_id']})
+                if saved:
+                    # converte _id para string se necessário
+                    saved['_id'] = str(saved['_id'])
+                    return { 'action': 'saved', 'blocos': saved.get('blocos', []) }
                 return { 'action': 'saved' }
             except Exception as e:
                 logging.exception('Erro ao atualizar blocos existentes')
@@ -864,7 +991,12 @@ async def post_conteudo(
                 'nome_marca': nome_marca,
                 'updated_at': datetime.utcnow()
             }
-            await db['conteudos'].insert_one(doc)
+            result = await db['conteudos'].insert_one(doc)
+            # Recupera o documento recém-criado
+            saved = await db['conteudos'].find_one({'_id': result.inserted_id})
+            if saved:
+                saved['_id'] = str(saved['_id'])
+                return { 'action': 'saved', 'blocos': saved.get('blocos', []) }
             return { 'action': 'saved' }
     except HTTPException:
         raise
