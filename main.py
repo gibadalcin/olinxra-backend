@@ -734,19 +734,35 @@ async def post_conteudo(
         else:
             logging.warning(f"[post_conteudo] Marca '{nome_marca}' não encontrada em 'logos' — salvando sem marca_id.")
 
-        # Construir filtro de upsert incluindo região — assim cada combinação
-        # (marca_id|nome_marca) + owner_uid + tipo_regiao + nome_regiao será única.
-        filtro = {
+        # Construir filtro base por owner + região
+        base_filtro = {
             'owner_uid': token.get('uid'),
             'tipo_regiao': tipo_regiao,
             'nome_regiao': nome_regiao
         }
-        if marca_obj_id:
-            filtro['marca_id'] = marca_obj_id
-        else:
-            filtro['nome_marca'] = nome_marca
 
-        existente = await db['conteudos'].find_one(filtro)
+        # Procurar documento existente de forma robusta:
+        # - se tivermos marca_obj_id, primeiro tente match por ObjectId,
+        #   depois tente pelo string equivalente (compatibilidade com docs antigos),
+        # - se não tivermos marca_obj_id, tente procurar por nome_marca.
+        existente = None
+        if marca_obj_id:
+            try:
+                existente = await db['conteudos'].find_one({**base_filtro, 'marca_id': marca_obj_id})
+            except Exception:
+                existente = None
+            if not existente:
+                # tenta também por string (caso o banco tenha o id como string)
+                try:
+                    existente = await db['conteudos'].find_one({**base_filtro, 'marca_id': str(marca_obj_id)})
+                except Exception:
+                    existente = None
+        else:
+            # sem marca_obj_id, usamos nome_marca como chave
+            try:
+                existente = await db['conteudos'].find_one({**base_filtro, 'nome_marca': nome_marca})
+            except Exception:
+                existente = None
 
         # Normalizar blocos para novos saves: garantir datetimes e remover campos
         # desnecessários em blocos de texto. Também valida se há URLs locais (blob:)
@@ -798,9 +814,14 @@ async def post_conteudo(
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
 
-        # Se blocos estiverem vazios e já existe documento -> deletar
+        # Se blocos estiverem vazios e já existe documento -> deletar (com confirmação)
         if existente and (not isinstance(cleaned_blocos, list) or len(cleaned_blocos) == 0):
-            await db['conteudos'].delete_one({'_id': existente['_id']})
+            try:
+                await db['conteudos'].delete_one({'_id': existente['_id']})
+                logging.info(f"[post_conteudo] Documento {_id if (exists := existente.get('_id')) is None else str(exists)} deletado (blocos vazios)")
+            except Exception as e:
+                logging.exception('Erro ao deletar documento existente com blocos vazios')
+                raise HTTPException(status_code=500, detail=f'Erro ao deletação: {str(e)}')
             return { 'action': 'deleted' }
 
         # Caso contrário, cria ou atualiza (upsert)
