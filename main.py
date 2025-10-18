@@ -696,8 +696,11 @@ async def add_content_image(
     nome_regiao: str = Form(""),
     token: dict = Depends(verify_firebase_token_dep)
 ):
-    allowed_types = ["image/png", "image/jpeg", "video/mp4"]
-    if file.content_type not in allowed_types:
+    # permitir tipos de imagem e vídeo mais comuns (inclui webp/gif/quicktime)
+    allowed_types = ["image/png", "image/jpeg", "image/webp", "image/gif", "video/mp4", "video/quicktime", "video/quicktime", "video/quicktime"]
+    # Fallback: aceita qualquer image/* ou video/* mas loga o tipo para auditoria
+    if not (file.content_type.startswith('image/') or file.content_type.startswith('video/')):
+        logging.warning(f"[add_content_image] Tipo de conteúdo rejeitado: {file.content_type}")
         raise HTTPException(status_code=400, detail="Tipo de arquivo não permitido.")
 
     import time
