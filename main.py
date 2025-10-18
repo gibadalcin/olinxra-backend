@@ -479,13 +479,22 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude)
     lat_filter = {"$gte": latitude - 0.01, "$lte": latitude + 0.01}
     lon_filter = {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
 
-    # 1) Busca por marca_id
+    # 1) Busca por marca_id — suportando tanto ObjectId quanto strings
     try:
         filtro = {
-            "marca_id": str(marca_id),
             "latitude": lat_filter,
             "longitude": lon_filter
         }
+        # Se o valor recebido já for um ObjectId, use-o diretamente.
+        # Caso contrário, tente converter para ObjectId; se falhar, pesquise pela string.
+        try:
+            if isinstance(marca_id, ObjectId):
+                filtro['marca_id'] = marca_id
+            else:
+                filtro['marca_id'] = ObjectId(str(marca_id))
+        except Exception:
+            filtro['marca_id'] = str(marca_id)
+
         doc = await db["conteudos"].find_one(filtro)
         if doc:
             return doc
