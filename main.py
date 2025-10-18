@@ -916,16 +916,16 @@ async def add_content_image(
         t2 = time.time()
         logging.info(f"[add_content_image] Tempo upload GCS: {t2-t1:.2f}s (total: {t2-t0:.2f}s)")
 
-            # created_at como datetime (não string) para evitar conversões repetidas
-            bloco_img = {
-                "tipo": tipo_bloco,
-                "subtipo": subtipo,
-                "url": gcs_url,
-                "nome": name,
-                "filename": gcs_filename,
-                "type": file.content_type,
-                "created_at": datetime.utcnow()
-            }
+        # created_at como datetime (não string) para evitar conversões repetidas
+        bloco_img = {
+            "tipo": tipo_bloco,
+            "subtipo": subtipo,
+            "url": gcs_url,
+            "nome": name,
+            "filename": gcs_filename,
+            "type": file.content_type,
+            "created_at": datetime.utcnow()
+        }
         # Gera signed_url para facilitar preview imediato no frontend (se possível)
         try:
             signed = gerar_signed_url_conteudo(gcs_url, gcs_filename)
