@@ -35,11 +35,43 @@ def get_bucket(tipo="logos"):
         raise RuntimeError(f"Bucket para tipo '{tipo}' não configurado.")
     return storage_client.bucket(bucket_name)
 
-def upload_image_to_gcs(local_path, filename, tipo="logos"):
+
+def upload_image_to_gcs(local_path, filename, tipo):
     """
     Faz o upload de um arquivo local para o Google Cloud Storage no bucket correto.
+
+    Nota: o parâmetro `tipo` é obrigatório e deve ser 'logos' ou 'conteudo'.
+    Esta função faz checagens adicionais para evitar que arquivos de conteúdo
+    sejam escritos acidentalmente no bucket de logos.
     """
+    if tipo not in ("logos", "conteudo"):
+        raise RuntimeError(f"Parâmetro 'tipo' inválido: {tipo}. Use 'logos' ou 'conteudo'.")
+
+    # Resolve o bucket esperado
     bucket = get_bucket(tipo)
+
+    # Segurança adicional: se pediram 'conteudo', garanta que o bucket final
+    # não seja o mesmo do logos. Caso haja inconsistência nas variáveis de
+    # ambiente, abortamos com erro explícito para evitar poluição do bucket.
+    if tipo == "conteudo":
+        if not GCS_BUCKET_CONTEUDO:
+            raise RuntimeError("GCS_BUCKET_CONTEUDO não configurado. Defina o bucket de conteúdo.")
+        # Se por alguma razão bucket.name ainda aponta para o bucket de logos,
+        # substituímos explicitamente pelo configurado em GCS_BUCKET_CONTEUDO.
+        if bucket.name == GCS_BUCKET_LOGOS:
+            if GCS_BUCKET_CONTEUDO and (GCS_BUCKET_CONTEUDO != GCS_BUCKET_LOGOS):
+                bucket = storage_client.bucket(GCS_BUCKET_CONTEUDO)
+            else:
+                raise RuntimeError(
+                    f"Bucket de conteúdo não configurado corretamente. Evitando upload em '{GCS_BUCKET_LOGOS}'. Defina GCS_BUCKET_CONTEUDO para o bucket de conteúdo (ex: 'olinxra-conteudo')."
+                )
+
+    # Log útil para debug em runtime (mas não exponha segredos)
+    try:
+        print(f"[gcs_utils] Uploading file '{filename}' to bucket '{bucket.name}' (tipo={tipo})")
+    except Exception:
+        pass
+
     blob = bucket.blob(filename)
     blob.upload_from_filename(local_path)
     gcs_url = f"gs://{bucket.name}/{filename}"
