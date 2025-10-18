@@ -688,6 +688,7 @@ async def post_conteudo(
 async def add_content_image(
     file: UploadFile = File(...),
     name: str = Form(...),
+    temp_id: str = Form(None),
     tipo_bloco: str = Form("imagem"),
     subtipo: str = Form(""),
     marca: str = Form(""),
@@ -742,7 +743,10 @@ async def add_content_image(
             signed = gcs_url
         t3 = time.time()
         logging.info(f"[add_content_image] Upload concluído (não persiste no DB). Tempo total: {t3-t0:.2f}s")
-        return {"success": True, "url": gcs_url, "signed_url": signed, "bloco": bloco_img}
+        resp = {"success": True, "url": gcs_url, "signed_url": signed, "bloco": bloco_img}
+        if temp_id:
+            resp["temp_id"] = temp_id
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
     finally:
