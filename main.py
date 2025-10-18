@@ -717,11 +717,11 @@ async def post_conteudo(
         if not nome_marca:
             raise HTTPException(status_code=422, detail="Campo 'nome_marca' é obrigatório.")
 
-        # Tentar resolver marca para obter um marca_id estável
+        # Tentar resolver marca para obter um marca_id estável (ObjectId)
         marca_doc = await logos_collection.find_one({"nome": nome_marca})
-        marca_id = None
+        marca_obj_id = None
         if marca_doc and "_id" in marca_doc:
-            marca_id = str(marca_doc["_id"])
+            marca_obj_id = marca_doc["_id"]
         else:
             logging.warning(f"[post_conteudo] Marca '{nome_marca}' não encontrada em 'logos' — salvando sem marca_id.")
 
@@ -732,29 +732,65 @@ async def post_conteudo(
             'tipo_regiao': tipo_regiao,
             'nome_regiao': nome_regiao
         }
-        if marca_id:
-            filtro['marca_id'] = marca_id
+        if marca_obj_id:
+            filtro['marca_id'] = marca_obj_id
         else:
             filtro['nome_marca'] = nome_marca
 
         existente = await db['conteudos'].find_one(filtro)
 
-        # Validar se há URLs locais (blob:) que indicam upload não finalizado
+        # Normalizar blocos para novos saves: garantir datetimes e remover campos
+        # desnecessários em blocos de texto. Também valida se há URLs locais (blob:)
+        # que indicam upload não finalizado.
         invalid_blocks = []
+        cleaned_blocos = []
         for idx, b in enumerate(blocos):
-            try:
-                u = b.get('url', '') if isinstance(b, dict) else ''
-                c = b.get('conteudo', '') if isinstance(b, dict) else ''
-                if (isinstance(u, str) and u.startswith('blob:')) or (isinstance(c, str) and c.startswith('blob:')):
-                    invalid_blocks.append({ 'index': idx, 'filename': (b.get('filename') or b.get('nome') or '') if isinstance(b, dict) else '' })
-            except Exception:
+            if not isinstance(b, dict):
                 continue
+            # detect blob: in url or conteudo
+            try:
+                u = b.get('url', '')
+                c = b.get('conteudo', '')
+                if (isinstance(u, str) and u.startswith('blob:')) or (isinstance(c, str) and c.startswith('blob:')):
+                    invalid_blocks.append({ 'index': idx, 'filename': (b.get('filename') or b.get('nome') or '') })
+                    # keep the block as-is for reporting; do not normalize
+                    cleaned_blocos.append(b)
+                    continue
+            except Exception:
+                cleaned_blocos.append(b)
+                continue
+
+            # Normalize created_at for blocos
+            created = b.get('created_at')
+            if isinstance(created, str):
+                try:
+                    created_dt = datetime.fromisoformat(created)
+                except Exception:
+                    try:
+                        created_dt = datetime.strptime(created, "%Y-%m-%d %H:%M:%S.%f")
+                    except Exception:
+                        created_dt = datetime.utcnow()
+                b['created_at'] = created_dt
+            elif created is None:
+                b['created_at'] = datetime.utcnow()
+
+            # If block is not media, strip media fields
+            if b.get('tipo') not in ('imagem', 'carousel', 'video'):
+                for k in ('url', 'filename', 'type', 'subtipo', 'created_at'):
+                    if k in b:
+                        b.pop(k, None)
+
+            # Remove ephemeral signed_url if present
+            if 'signed_url' in b:
+                b.pop('signed_url', None)
+
+            cleaned_blocos.append(b)
         if invalid_blocks:
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
 
         # Se blocos estiverem vazios e já existe documento -> deletar
-        if existente and (not isinstance(blocos, list) or len(blocos) == 0):
+        if existente and (not isinstance(cleaned_blocos, list) or len(cleaned_blocos) == 0):
             await db['conteudos'].delete_one({'_id': existente['_id']})
             return { 'action': 'deleted' }
 
@@ -770,14 +806,15 @@ async def post_conteudo(
                 # edita um existente e envia o estado completo de volta.
                 update_doc = {
                     **filtro,
-                    'blocos': list(blocos),
+                    'blocos': list(cleaned_blocos),
                     'latitude': latitude,
                     'longitude': longitude,
+                    'location': { 'type': 'Point', 'coordinates': [ longitude, latitude ] } if (latitude is not None and longitude is not None) else None,
                     'tipo_regiao': tipo_regiao,
                     'nome_regiao': nome_regiao,
-                    'marca_id': marca_id,
+                    'marca_id': marca_obj_id,
                     'nome_marca': nome_marca,
-                    'updated_at': str(datetime.utcnow())
+                    'updated_at': datetime.utcnow()
                 }
                 await db['conteudos'].update_one({'_id': existente['_id']}, {'$set': update_doc})
                 return { 'action': 'saved' }
@@ -787,14 +824,15 @@ async def post_conteudo(
         else:
             doc = {
                 **filtro,
-                'blocos': blocos,
+                'blocos': cleaned_blocos,
                 'latitude': latitude,
                 'longitude': longitude,
+                'location': { 'type': 'Point', 'coordinates': [ longitude, latitude ] } if (latitude is not None and longitude is not None) else None,
                 'tipo_regiao': tipo_regiao,
                 'nome_regiao': nome_regiao,
-                'marca_id': marca_id,
+                'marca_id': marca_obj_id,
                 'nome_marca': nome_marca,
-                'updated_at': str(datetime.utcnow())
+                'updated_at': datetime.utcnow()
             }
             await db['conteudos'].insert_one(doc)
             return { 'action': 'saved' }
