@@ -835,7 +835,7 @@ async def post_conteudo(
                 # Isso evita duplicações quando o frontend carrega os blocos,
                 # edita um existente e envia o estado completo de volta.
                 update_doc = {
-                    **filtro,
+                    **base_filtro,
                     'blocos': list(cleaned_blocos),
                     'latitude': latitude,
                     'longitude': longitude,
@@ -853,7 +853,7 @@ async def post_conteudo(
                 raise HTTPException(status_code=500, detail=f'Erro ao salvar conteúdo: {str(e)}')
         else:
             doc = {
-                **filtro,
+                **base_filtro,
                 'blocos': cleaned_blocos,
                 'latitude': latitude,
                 'longitude': longitude,
