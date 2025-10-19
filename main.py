@@ -18,6 +18,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs, get_bucket
+from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
 from email.mime.text import MIMEText
@@ -299,6 +300,16 @@ async def _search_and_compare_logic(file: UploadFile):
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@app.post('/api/validate-button-block')
+async def api_validate_button_block(payload: dict = Body(...), token: dict = Depends(verify_firebase_token_dep)):
+    """Valida um payload de botão usando o Pydantic schema; usado apenas para testes e adm."""
+    try:
+        validated = validate_button_block_payload(payload)
+        return {"valid": True, "normalized": validated.dict(exclude_none=True)}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
 
 @app.post('/search-logo/')
 async def search_logo(file: UploadFile = File(...)):
@@ -994,6 +1005,32 @@ async def post_conteudo(
         if invalid_blocks:
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
+
+        # Validate button blocks (botao_destaque / botao_default) before persisting
+        try:
+            from pydantic import ValidationError
+            from schemas import validate_button_block_payload
+            for bi, bb in enumerate(cleaned_blocos):
+                try:
+                    if not isinstance(bb, dict):
+                        continue
+                    tipo_check = (bb.get('tipo') or '').lower()
+                    if tipo_check in ('botao_destaque', 'botao_default'):
+                        # will raise ValidationError if invalid
+                        validate_button_block_payload(bb)
+                except ValidationError as ve:
+                    # pydantic ValidationError -> return 422 with details
+                    raise HTTPException(status_code=422, detail={ 'message': f'Invalid button block at index {bi}', 'error': str(ve) })
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    # Any other error in validation of this block
+                    raise HTTPException(status_code=422, detail={ 'message': f'Invalid button block at index {bi}', 'error': str(e) })
+        except HTTPException:
+            raise
+        except Exception:
+            # If schemas cannot be imported or another issue occurs, log and continue
+            logging.exception('[post_conteudo] Unexpected error during button block validation; skipping strict validation')
 
         # Se blocos estiverem vazios e já existe documento -> deletar (com confirmação)
         if existente and (not isinstance(cleaned_blocos, list) or len(cleaned_blocos) == 0):
