@@ -1056,6 +1056,15 @@ async def post_conteudo(
                                 a['name'] = meta.get('name')
                             bb['action'] = a
 
+                        # Remove analytics object if it's empty or has no event_name to avoid rejecting payloads
+                        try:
+                            an = bb.get('analytics')
+                            if isinstance(an, dict):
+                                if not an.get('event_name'):
+                                    bb.pop('analytics', None)
+                        except Exception:
+                            pass
+
                         # If after hydration required fields are still missing, build a helpful error
                         missing = []
                         if not bb.get('label'):
