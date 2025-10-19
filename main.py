@@ -1007,6 +1007,8 @@ async def post_conteudo(
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
 
         # Validate button blocks (botao_destaque / botao_default) before persisting
+        # Note: frontend may place editable fields inside bloco['meta'] (for local editing state).
+        # To be tolerant, hydrate top-level fields from meta when missing so validation succeeds.
         try:
             from pydantic import ValidationError
             from schemas import validate_button_block_payload
@@ -1016,6 +1018,18 @@ async def post_conteudo(
                         continue
                     tipo_check = (bb.get('tipo') or '').lower()
                     if tipo_check in ('botao_destaque', 'botao_default'):
+                        # If frontend sent fields inside meta (e.g. meta.action or meta.label), copy them up
+                        meta = bb.get('meta') or {}
+                        if isinstance(meta, dict):
+                            if not bb.get('action') and meta.get('action'):
+                                bb['action'] = meta.get('action')
+                            if not bb.get('label') and meta.get('label'):
+                                bb['label'] = meta.get('label')
+                            # copy other optional decorative/button props if present
+                            for fld in ('variant', 'color', 'icon', 'size', 'disabled', 'aria_label', 'analytics', 'visibility', 'position', 'temp_id'):
+                                if bb.get(fld) is None and meta.get(fld) is not None:
+                                    bb[fld] = meta.get(fld)
+
                         # will raise ValidationError if invalid
                         validate_button_block_payload(bb)
                 except ValidationError as ve:

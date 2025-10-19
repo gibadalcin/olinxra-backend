@@ -22,6 +22,19 @@ class ButtonAction(BaseModel):
         return v
 
 
+class Action(BaseModel):
+    """Generic action model usable by media blocks (images/carousel items).
+
+    Mirrors ButtonAction but makes fields optional so media may have a clickable action
+    without forcing the same strict requirements as buttons.
+    """
+    type: Optional[Literal['link', 'callback']] = 'link'
+    href: Optional[str] = None
+    target: Optional[Literal['_self', '_blank']] = '_self'
+    name: Optional[str] = None
+    params: Optional[Dict[str, Any]] = None
+
+
 class AnalyticsSpec(BaseModel):
     event_name: Optional[str] = None
     params: Optional[Dict[str, Any]] = None
