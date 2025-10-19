@@ -1021,14 +1021,56 @@ async def post_conteudo(
                         # If frontend sent fields inside meta (e.g. meta.action or meta.label), copy them up
                         meta = bb.get('meta') or {}
                         if isinstance(meta, dict):
+                            # action may be nested or split across keys
                             if not bb.get('action') and meta.get('action'):
                                 bb['action'] = meta.get('action')
-                            if not bb.get('label') and meta.get('label'):
-                                bb['label'] = meta.get('label')
+                            # also accept href/link/url directly on meta
+                            if not bb.get('action') and (meta.get('href') or meta.get('link') or meta.get('url')):
+                                bb['action'] = meta.get('action') if meta.get('action') else { 'type': 'link', 'href': meta.get('href') or meta.get('link') or meta.get('url'), 'target': meta.get('target') or '_self' }
+
+                            # label may be stored under different keys in meta
+                            if not bb.get('label'):
+                                for key in ('label', 'buttonLabel', 'button_label', 'text', 'title'):
+                                    if meta.get(key):
+                                        bb['label'] = meta.get(key)
+                                        break
+
                             # copy other optional decorative/button props if present
                             for fld in ('variant', 'color', 'icon', 'size', 'disabled', 'aria_label', 'analytics', 'visibility', 'position', 'temp_id'):
                                 if bb.get(fld) is None and meta.get(fld) is not None:
                                     bb[fld] = meta.get(fld)
+
+                        # If action is a dict-like in meta.action but missing required nested fields, try to hydrate
+                        if isinstance(bb.get('action'), dict):
+                            a = bb['action']
+                            # try to fill href from meta top-level if missing
+                            if a.get('type') == 'link' and not a.get('href'):
+                                if meta.get('href'):
+                                    a['href'] = meta.get('href')
+                                elif meta.get('link'):
+                                    a['href'] = meta.get('link')
+                                elif meta.get('url'):
+                                    a['href'] = meta.get('url')
+                            # try to fill name for callback
+                            if a.get('type') == 'callback' and not a.get('name') and meta.get('name'):
+                                a['name'] = meta.get('name')
+                            bb['action'] = a
+
+                        # If after hydration required fields are still missing, build a helpful error
+                        missing = []
+                        if not bb.get('label'):
+                            missing.append('label')
+                        if not bb.get('action'):
+                            missing.append('action')
+                        # If action exists but lacks href/name depending on type, mark as missing
+                        if bb.get('action') and isinstance(bb.get('action'), dict):
+                            at = bb['action'].get('type')
+                            if at == 'link' and not bb['action'].get('href'):
+                                missing.append('action.href')
+                            if at == 'callback' and not bb['action'].get('name'):
+                                missing.append('action.name')
+                        if missing:
+                            raise HTTPException(status_code=422, detail={ 'message': f'Invalid button block at index {bi}', 'missing': missing, 'meta_keys': list(meta.keys()), 'block_preview': bb })
 
                         # will raise ValidationError if invalid
                         validate_button_block_payload(bb)
