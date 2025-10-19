@@ -2,6 +2,7 @@
 import os
 import json
 from google.cloud import storage
+from google.api_core.exceptions import NotFound
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -96,16 +97,67 @@ def delete_file(filename, tipo="conteudo"):
             else:
                 # fallback: last segment
                 filename = filename.split('/')[-1]
+
+        # If the provided filename looks like a "folder" (ends with '/'),
+        # treat it as a prefix and delete all objects under that prefix.
+        if isinstance(filename, str) and filename.endswith('/'):
+            prefix = filename
+            try:
+                blobs = list(storage_client.list_blobs(bucket.name, prefix=prefix))
+            except Exception as e:
+                try:
+                    print(f"[gcs_utils] Error listing blobs with prefix '{prefix}' in bucket '{bucket.name}': {e}")
+                except Exception:
+                    pass
+                return False
+            if not blobs:
+                try:
+                    print(f"[gcs_utils] No objects found with prefix '{prefix}' in bucket '{bucket.name}'. Nothing to delete.")
+                except Exception:
+                    pass
+                return True
+            deleted = 0
+            for b in blobs:
+                try:
+                    b.delete()
+                    deleted += 1
+                except Exception as e:
+                    try:
+                        print(f"[gcs_utils] Failed to delete blob '{b.name}' under prefix '{prefix}': {e}")
+                    except Exception:
+                        pass
+                    # continue deleting other blobs
+            try:
+                print(f"[gcs_utils] Deleted {deleted} objects with prefix '{prefix}' from bucket '{bucket.name}'")
+            except Exception:
+                pass
+            return True
+
+        # Normal file delete path
         blob = bucket.blob(filename)
-        blob.delete()
         try:
-            print(f"[gcs_utils] Deleted file '{filename}' from bucket '{bucket.name}'")
-        except Exception:
-            pass
-        return True
+            blob.delete()
+            try:
+                print(f"[gcs_utils] Deleted file '{filename}' from bucket '{bucket.name}'")
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            # If the blob was not found, treat as success (idempotent behaviour)
+            if isinstance(e, NotFound):
+                try:
+                    print(f"[gcs_utils] Object '{filename}' not found in bucket '{bucket.name}' (treated as deleted).")
+                except Exception:
+                    pass
+                return True
+            try:
+                print(f"[gcs_utils] Failed to delete '{filename}' from bucket '{bucket.name}': {e}")
+            except Exception:
+                pass
+            return False
     except Exception as e:
         try:
-            print(f"[gcs_utils] Failed to delete '{filename}' from bucket '{bucket.name}': {e}")
+            print(f"[gcs_utils] Unexpected error when deleting '{filename}' from bucket '{bucket.name}': {e}")
         except Exception:
             pass
         return False
