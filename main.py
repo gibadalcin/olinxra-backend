@@ -727,6 +727,13 @@ async def consulta_conteudo(
                 "mensagem": "Conteúdo encontrado.",
                 "localizacao": local_str
             }
+            
+            # include radius_m if present in the stored document so frontends can prefill/edit it
+            try:
+                if isinstance(conteudo, dict) and conteudo.get('radius_m') is not None:
+                    resultado['radius_m'] = conteudo.get('radius_m')
+            except Exception:
+                pass
             if conteudo.get('_matched_by'):
                 resultado['matched_by'] = conteudo.get('_matched_by')
             if conteudo.get('_distance_m') is not None:
@@ -798,6 +805,11 @@ async def get_conteudo(
             "mensagem": "Conteúdo encontrado.",
             "localizacao": local_str
         }
+        try:
+            if isinstance(conteudo, dict) and conteudo.get('radius_m') is not None:
+                resultado['radius_m'] = conteudo.get('radius_m')
+        except Exception:
+            pass
     else:
         resultado = {
             "conteudo": None,
@@ -831,13 +843,20 @@ async def get_conteudo_por_regiao(
         blocos_ret = conteudo.get("blocos", [])
         if blocos_ret:
             await attach_signed_urls_to_blocos(blocos_ret)
-        return {
+        resp = {
             "blocos": blocos_ret,
             "tipo_regiao": conteudo.get("tipo_regiao"),
             "nome_regiao": conteudo.get("nome_regiao"),
             "latitude": conteudo.get("latitude"),
             "longitude": conteudo.get("longitude"),
         }
+        # Include radius if present so admin UI can prefill the field
+        try:
+            if conteudo.get('radius_m') is not None:
+                resp['radius_m'] = conteudo.get('radius_m')
+        except Exception:
+            pass
+        return resp
     return {"blocos": []}
 
 
