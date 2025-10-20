@@ -526,7 +526,7 @@ async def debug_inspect_request(data: dict = Body(...)):
     logging.info(f'[debug-inspect-request] Corpo recebido: {str(data)[:500]}')
     return {"received": data}
 
-async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude):
+async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude, radius_m: float = None):
     """
     Procura um documento de conteúdo pela marca (preferencialmente por marca_id) e
     por faixa de latitude/longitude.
@@ -539,6 +539,52 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude)
     Isso garante compatibilidade com documentos antigos que usam `nome_marca` e com
     novos documentos que usam `marca_id`.
     """
+    # If radius_m is provided, try a geospatial $geoNear query first (more precise).
+    # maxDistance for GeoJSON $near/$geoNear is in meters when using 2dsphere index.
+    try:
+        if radius_m is not None and latitude is not None and longitude is not None:
+            # If we have marca_id, prefer to search by marca_id, otherwise by nome_marca will be resolved below.
+            try:
+                query = { }
+                if marca_id:
+                    query['marca_id'] = marca_id
+                # Use aggregation with $geoNear to get distance metadata
+                pipeline = [
+                    {
+                        "$geoNear": {
+                            "near": {"type": "Point", "coordinates": [ float(longitude), float(latitude) ]},
+                            "distanceField": "dist.calculated",
+                            "maxDistance": float(radius_m),
+                            "spherical": True,
+                            "query": query
+                        }
+                    },
+                    {"$limit": 1}
+                ]
+                cursor = db['conteudos'].aggregate(pipeline)
+                docs = []
+                async for doc in cursor:
+                    docs.append(doc)
+                if docs and len(docs) > 0:
+                    # return the first match along with distance (meters)
+                    d0 = docs[0]
+                    d0['_id'] = d0.get('_id')
+                    d0['_matched_by'] = 'distance'
+                    # dist.calculated is in meters
+                    try:
+                        d0['_distance_m'] = float(d0.get('dist', {}).get('calculated', 0))
+                    except Exception:
+                        d0['_distance_m'] = None
+                    return d0
+            except Exception:
+                # if geo query fails, fall back to bounding box approach below
+                pass
+
+    except Exception:
+        # if anything goes wrong with radius logic, continue to fallback search
+        pass
+
+    # Fallback: use bounding box deltas for lat/lon when radius not provided or geo query failed
     lat_filter = {"$gte": latitude - 0.01, "$lte": latitude + 0.01}
     lon_filter = {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
 
@@ -635,9 +681,11 @@ def make_cache_key(nome_marca, latitude, longitude):
 async def consulta_conteudo(
     nome_marca: str = Body(...),
     latitude: float = Body(...),
-    longitude: float = Body(...)
+    longitude: float = Body(...),
+    radius_m: float = Body(None)
 ):
-    cache_key = make_cache_key(nome_marca, latitude, longitude)
+    # include radius in cache key to avoid stale results
+    cache_key = (nome_marca, round(latitude, 6), round(longitude, 6), int(radius_m) if radius_m else None)
     if cache_key in consulta_cache:
         return consulta_cache[cache_key]
 
@@ -649,7 +697,7 @@ async def consulta_conteudo(
         return resultado
 
     # Busca conteúdo associado à marca e localização usando a função
-    conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude)
+    conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude, radius_m)
 
     # Busca endereço detalhado usando geocodificação reversa
     endereco = await geocode_reverse(latitude, longitude)
@@ -665,16 +713,34 @@ async def consulta_conteudo(
     local_str = local_str.strip(", ").replace(",,", ",")
 
     if conteudo:
-        resultado = {
-            "conteudo": {
-                "texto": conteudo.get("texto", ""),
-                "imagens": conteudo.get("imagens", []),  # lista de URLs
-                "videos": conteudo.get("videos", []),    # lista de URLs
-                # outros campos para RA podem ser adicionados aqui
-            },
-            "mensagem": "Conteúdo encontrado.",
-            "localizacao": local_str
-        }
+        # If backend returned a full conteudo document (with blocos), attach signed urls
+        if isinstance(conteudo, dict) and conteudo.get('blocos'):
+            blocos_doc = conteudo.get('blocos', [])
+            try:
+                await attach_signed_urls_to_blocos(blocos_doc)
+            except Exception:
+                pass
+            resultado = {
+                "conteudo": {
+                    "blocos": blocos_doc
+                },
+                "mensagem": "Conteúdo encontrado.",
+                "localizacao": local_str
+            }
+            if conteudo.get('_matched_by'):
+                resultado['matched_by'] = conteudo.get('_matched_by')
+            if conteudo.get('_distance_m') is not None:
+                resultado['distance_m'] = conteudo.get('_distance_m')
+        else:
+            resultado = {
+                "conteudo": {
+                    "texto": conteudo.get("texto", ""),
+                    "imagens": conteudo.get("imagens", []),
+                    "videos": conteudo.get("videos", []),
+                },
+                "mensagem": "Conteúdo encontrado.",
+                "localizacao": local_str
+            }
     else:
         resultado = {
             "conteudo": None,
@@ -699,9 +765,10 @@ async def listar_marcas(
 async def get_conteudo(
     nome_marca: str = Query(..., description="Nome da marca"),
     latitude: float = Query(..., description="Latitude"),
-    longitude: float = Query(..., description="Longitude")
+    longitude: float = Query(..., description="Longitude"),
+    radius: float = Query(None, description="Optional radius in meters to search by proximity")
 ):
-    cache_key = (nome_marca, round(latitude, 6), round(longitude, 6))
+    cache_key = (nome_marca, round(latitude, 6), round(longitude, 6), int(radius) if radius else None)
     if cache_key in consulta_cache:
         return consulta_cache[cache_key]
 
@@ -711,7 +778,7 @@ async def get_conteudo(
         consulta_cache[cache_key] = resultado
         return resultado
 
-    conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude)
+    conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude, radius)
     endereco = await geocode_reverse(latitude, longitude)
     local_str = ", ".join([
         endereco.get("road", ""),
