@@ -860,6 +860,16 @@ async def post_conteudo(
         tipo_regiao = payload.get('tipo_regiao')
         nome_regiao = payload.get('nome_regiao')
 
+        # Validação estrita para radius_m: se fornecido, deve ser convertível para float e não-negativo
+        radius_val = None
+        if 'radius_m' in payload and payload.get('radius_m') is not None:
+            try:
+                radius_val = float(payload.get('radius_m'))
+                if radius_val < 0:
+                    raise HTTPException(status_code=422, detail="Campo 'radius_m' deve ser um número não-negativo.")
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=422, detail="Campo 'radius_m' inválido; deve ser um número (metros).")
+
         if not nome_marca:
             raise HTTPException(status_code=422, detail="Campo 'nome_marca' é obrigatório.")
 
@@ -1255,6 +1265,9 @@ async def post_conteudo(
                     'nome_marca': nome_marca,
                     'updated_at': datetime.utcnow()
                 }
+                # Persist admin-provided radius (optional) when present (usando valor validado)
+                if radius_val is not None:
+                    update_doc['radius_m'] = radius_val
                 # Before updating, determine which files were removed and delete them from GCS
                 try:
                     old_blocos = existente.get('blocos', []) or []
@@ -1351,6 +1364,9 @@ async def post_conteudo(
                 'nome_marca': nome_marca,
                 'updated_at': datetime.utcnow()
             }
+            # Persist admin-provided radius (optional) when present (usando valor validado)
+            if radius_val is not None:
+                doc['radius_m'] = radius_val
             result = await db['conteudos'].insert_one(doc)
             # Recupera o documento recém-criado
             saved = await db['conteudos'].find_one({'_id': result.inserted_id})
