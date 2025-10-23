@@ -509,40 +509,7 @@ async def api_generate_glb_from_image(payload: dict = Body(...)):
                 os.remove(temp_glb)
         except Exception:
             pass
-    from gcs_utils import get_bucket
-    def montar_url(img):
-        filename = img.get("filename")
-        url_gcs = img.get("url", "")
-        if not filename:
-            logging.error(f"Imagem sem filename: {img}")
-            return ""
-        # Detecta o tipo de bucket pelo prefixo da URL salva no banco
-        tipo_bucket = "logos"
-        if url_gcs.startswith("gs://olinxra-conteudo/"):
-            tipo_bucket = "conteudo"
-        elif url_gcs.startswith("gs://olinxra-logos/"):
-            tipo_bucket = "logos"
-        else:
-            # fallback: tenta pelo nome do bucket no filename
-            if "conteudo" in filename:
-                tipo_bucket = "conteudo"
-        try:
-            bucket = get_bucket(tipo_bucket)
-            url = bucket.blob(filename).generate_signed_url(
-                version="v4",
-                expiration=3600,
-                method="GET"
-            )
-            return url
-        except Exception as e:
-            logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
-            return ""
-    return [{
-        "url": montar_url(img),
-        "_id": str(img.get("_id")),
-        "owner_uid": img.get("owner_uid"),
-        "nome": img.get("nome", "")
-    } for img in imagens]
+    
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
