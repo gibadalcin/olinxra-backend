@@ -3,7 +3,7 @@ import struct
 import math
 from typing import Tuple
 
-from pygltflib import GLTF2, Buffer, BufferView, Accessor, Scene, Node, Mesh, Primitive, Image, Texture, Material, PBRMetallicRoughness
+from pygltflib import GLTF2, Buffer, BufferView, Accessor, Scene, Node, Mesh, Primitive, Image, Texture, Material
 
 
 def _pack_floats(floats):
@@ -125,9 +125,11 @@ def generate_plane_glb(image_path: str, output_glb_path: str) -> None:
     tex_idx = 0
 
     # Material
-    pbr = PBRMetallicRoughness()
-    pbr.baseColorTexture = {"index": tex_idx}
-    mat = Material(pbrMetallicRoughness=pbr, name="mat0")
+    # Some pygltflib versions don't export PBRMetallicRoughness symbol directly.
+    # Use a plain dict or set attribute on Material to avoid import-time errors.
+    mat = Material(name="mat0")
+    # set pbrMetallicRoughness as a dict with baseColorTexture reference
+    mat.pbrMetallicRoughness = {"baseColorTexture": {"index": tex_idx}}
     gltf.materials = [mat]
     mat_idx = 0
 
