@@ -7,6 +7,7 @@ import firebase_admin
 import httpx
 import tempfile
 import smtplib
+import hashlib
 from fastapi import Request
 from firebase_admin import credentials, auth
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Form, Query, Body, Security
@@ -18,12 +19,14 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs, get_bucket
+from glb_generator import generate_plane_glb
 from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
 from email.mime.text import MIMEText
 import asyncio
 import onnxruntime as ort
+from PIL import Image as PILImage
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 
@@ -398,6 +401,114 @@ async def get_images(ownerId: str = None):
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
     logging.info(f"Imagens encontradas: {imagens}")
+    return imagens
+
+
+@app.post('/api/generate-glb-from-image')
+async def api_generate_glb_from_image(payload: dict = Body(...)):
+    """
+    Generate a simple GLB from a remote image URL and upload to GCS. Returns signed URL.
+    Expects payload: { "image_url": "https://...", "filename": "optional-name.glb" }
+    """
+    image_url = payload.get('image_url')
+    # Use hash-based filename for stable cache key (avoid re-generating for same image_url)
+    if not image_url:
+        raise HTTPException(status_code=400, detail='image_url required')
+    sha = hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:16]
+    filename = payload.get('filename') or f'generated_{sha}.glb'
+    if not image_url:
+        raise HTTPException(status_code=400, detail='image_url required')
+
+    temp_image = None
+    temp_glb = None
+    try:
+        # Configurable limits / whitelist
+        ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv('GLB_ALLOWED_DOMAINS', '').split(',') if d.strip()]
+        MAX_IMAGE_BYTES = int(os.getenv('GLB_MAX_IMAGE_BYTES', '5000000'))  # 5 MB default
+        MAX_IMAGE_DIM = int(os.getenv('GLB_MAX_DIM', '2048'))
+
+        # If a domain whitelist is set, validate the image_url hostname
+        from urllib.parse import urlparse
+        parsed = urlparse(image_url)
+        if parsed.scheme not in ('https',):
+            raise HTTPException(status_code=400, detail='image_url must use https scheme')
+        hostname = (parsed.hostname or '').lower()
+        if ALLOWED_DOMAINS and hostname not in ALLOWED_DOMAINS:
+            raise HTTPException(status_code=400, detail='image_url host not allowed')
+
+        # Check cache: does file already exist in GCS?
+        bucket = get_bucket('conteudo')
+        blob = bucket.blob(filename)
+        exists = await asyncio.to_thread(blob.exists)
+        if exists:
+            gcs_path = f'gs://{bucket.name}/{filename}'
+            signed = gerar_signed_url_conteudo(gcs_path, filename)
+            return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }
+
+        # download image with streaming, enforce max bytes
+        async with httpx.AsyncClient(timeout=30.0) as client_http:
+            async with client_http.stream('GET', image_url, follow_redirects=True, timeout=30.0) as resp:
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=400, detail='Failed to download image')
+                content_type = resp.headers.get('content-type', '')
+                if not content_type.startswith('image'):
+                    raise HTTPException(status_code=400, detail='URL does not point to an image')
+                content_length = resp.headers.get('content-length')
+                if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                    raise HTTPException(status_code=413, detail='Image too large')
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(parsed.path)[1] or '.jpg') as tf:
+                    temp_image = tf.name
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_IMAGE_BYTES:
+                            raise HTTPException(status_code=413, detail='Image too large')
+                        tf.write(chunk)
+
+        # Resize/normalize image if too big in dimensions (run in thread)
+        def _resize_if_needed(src_path, max_dim):
+            img = PILImage.open(src_path)
+            w, h = img.size
+            if max(w, h) > max_dim:
+                ratio = max_dim / float(max(w, h))
+                new_size = (int(w * ratio), int(h * ratio))
+                img = img.convert('RGB')
+                img = img.resize(new_size, PILImage.LANCZOS)
+                dst = src_path + '.resized.jpg'
+                img.save(dst, format='JPEG', quality=90)
+                return dst
+            return src_path
+
+        processed_image = await asyncio.to_thread(_resize_if_needed, temp_image, MAX_IMAGE_DIM)
+
+        # generate glb
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
+            temp_glb = tg.name
+
+        # run generator in thread to avoid blocking
+        await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb)
+
+        # upload to GCS using the stable filename
+        gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')
+        signed = gerar_signed_url_conteudo(gcs_path, filename)
+        return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception('Erro gerando GLB: %s', e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if temp_image and os.path.exists(temp_image):
+                os.remove(temp_image)
+        except Exception:
+            pass
+        try:
+            if temp_glb and os.path.exists(temp_glb):
+                os.remove(temp_glb)
+        except Exception:
+            pass
     from gcs_utils import get_bucket
     def montar_url(img):
         filename = img.get("filename")
