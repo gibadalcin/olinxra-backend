@@ -725,7 +725,10 @@ async def consulta_conteudo(
                     "blocos": blocos_doc
                 },
                 "mensagem": "Conteúdo encontrado.",
-                "localizacao": local_str
+                "localizacao": local_str,
+                "endereco": endereco,
+                "tipo_regiao": conteudo.get('tipo_regiao'),
+                "nome_regiao": conteudo.get('nome_regiao')
             }
             
             # include radius_m if present in the stored document so frontends can prefill/edit it
@@ -746,13 +749,15 @@ async def consulta_conteudo(
                     "videos": conteudo.get("videos", []),
                 },
                 "mensagem": "Conteúdo encontrado.",
-                "localizacao": local_str
+                "localizacao": local_str,
+                "endereco": endereco
             }
     else:
         resultado = {
             "conteudo": None,
             "mensagem": f"Nenhum conteúdo associado a esta marca neste local: {local_str}.",
-            "localizacao": local_str
+            "localizacao": local_str,
+            "endereco": endereco
         }
 
     consulta_cache[cache_key] = resultado
@@ -803,8 +808,18 @@ async def get_conteudo(
         resultado = {
             "conteudo": blocos_resp,
             "mensagem": "Conteúdo encontrado.",
-            "localizacao": local_str
+            "localizacao": local_str,
+            "endereco": endereco,
         }
+        # If the stored document included region metadata, pass it through
+        try:
+            if isinstance(conteudo, dict):
+                if conteudo.get('tipo_regiao') is not None:
+                    resultado['tipo_regiao'] = conteudo.get('tipo_regiao')
+                if conteudo.get('nome_regiao') is not None:
+                    resultado['nome_regiao'] = conteudo.get('nome_regiao')
+        except Exception:
+            pass
         try:
             if isinstance(conteudo, dict) and conteudo.get('radius_m') is not None:
                 resultado['radius_m'] = conteudo.get('radius_m')
