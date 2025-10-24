@@ -11,6 +11,7 @@ import hashlib
 from fastapi import Request
 from firebase_admin import credentials, auth
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Form, Query, Body, Security
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -97,6 +98,19 @@ async def lifespan(app: FastAPI):
         client.close()
 
 app = FastAPI(lifespan=lifespan)
+
+# Response class that sanitizes returned Python objects (BSON types etc.)
+class SanitizedJSONResponse(JSONResponse):
+    def render(self, content: any) -> bytes:
+        try:
+            safe = _make_serializable(content)
+        except Exception:
+            # fallback to original content if sanitization fails
+            safe = content
+        return super().render(safe)
+
+# Use sanitized JSON response as default to avoid accidental ObjectId/datetime serialization errors
+app.default_response_class = SanitizedJSONResponse
 
 # --- Helpers de Inicialização ---
 ###############################################################
@@ -511,7 +525,22 @@ async def get_images(ownerId: str = None):
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
     logging.info(f"Imagens encontradas: {imagens}")
-    return imagens
+    # Ensure BSON types (ObjectId, datetime) are converted to JSON-serializable types
+    try:
+        # default response class will sanitize BSON types; return raw documents
+        return imagens
+    except Exception:
+        # Fallback: stringify ObjectId fields
+        out = []
+        for doc in imagens:
+            try:
+                out.append(doc)
+            except Exception:
+                # last resort: convert _id to str and return
+                if isinstance(doc, dict) and doc.get('_id'):
+                    doc['_id'] = str(doc['_id'])
+                out.append(doc)
+        return out
 
 
 @app.post('/api/generate-glb-from-image')
@@ -918,7 +947,6 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
                 if docs and len(docs) > 0:
                     # return the first match along with distance (meters)
                     d0 = docs[0]
-                    d0['_id'] = d0.get('_id')
                     d0['_matched_by'] = 'distance'
                     # dist.calculated is in meters
                     try:
@@ -1002,7 +1030,8 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
         "latitude": lat_filter,
         "longitude": lon_filter
     }
-    return await db["conteudos"].find_one(filtro3)
+    doc = await db["conteudos"].find_one(filtro3)
+    return doc if doc else None
 
 async def geocode_reverse(lat, lon):
     url = "https://nominatim.openstreetmap.org/reverse"
