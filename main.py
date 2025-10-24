@@ -11,7 +11,6 @@ import hashlib
 from fastapi import Request
 from firebase_admin import credentials, auth
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Form, Query, Body, Security
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -19,10 +18,8 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
-from gcs_utils import upload_image_to_gcs, get_bucket, storage_client
+from gcs_utils import upload_image_to_gcs, get_bucket
 from glb_generator import generate_plane_glb
-# refatorado: use orchestrator centralizado para geração/upload/persistência de GLB
-from glb_orchestrator import generate_glb_internal
 from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
@@ -33,11 +30,7 @@ from PIL import Image as PILImage
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
-# Reduce noisy logs from third-party libraries
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('google.cloud').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 load_dotenv()
 
 
@@ -84,12 +77,12 @@ async def lifespan(app: FastAPI):
         # Índice simples por owner_uid
         await db['conteudos'].create_index([('owner_uid', 1)], name='idx_owner_uid')
 
-        logging.debug('Índices de conteúdo verificados/criados com sucesso.')
+        logging.info('Índices de conteúdo verificados/criados com sucesso.')
     except Exception as e:
         logging.exception(f'Falha ao criar índices em conteudos: {e}')
     # REMOVIDO: images_collection = db["images"]
 
-    logging.debug("Iniciando a aplicação...")
+    logging.info("Iniciando a aplicação...")
     initialize_firebase()
     initialize_onnx_session()
     await load_faiss_index()
@@ -98,19 +91,6 @@ async def lifespan(app: FastAPI):
         client.close()
 
 app = FastAPI(lifespan=lifespan)
-
-# Response class that sanitizes returned Python objects (BSON types etc.)
-class SanitizedJSONResponse(JSONResponse):
-    def render(self, content: any) -> bytes:
-        try:
-            safe = _make_serializable(content)
-        except Exception:
-            # fallback to original content if sanitization fails
-            safe = content
-        return super().render(safe)
-
-# Use sanitized JSON response as default to avoid accidental ObjectId/datetime serialization errors
-app.default_response_class = SanitizedJSONResponse
 
 # --- Helpers de Inicialização ---
 ###############################################################
@@ -142,92 +122,15 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
             expiration=3600,
             method="GET"
         )
-        # Log minimal info at DEBUG (do not include full signed URL in logs)
-        logging.debug(f"Signed URL gerada para bucket={tipo_bucket} filename={filename}")
         return url
     except Exception as e:
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return ""
 
-
-def format_address_string(endereco: dict) -> str:
-    """Formata um objeto de endereço retornado por geocode_reverse em uma string legível.
-
-    Mantém apenas partes não vazias e garante pontuação consistente.
-    """
-    try:
-        parts = [
-            endereco.get("road", "") if isinstance(endereco, dict) else "",
-            endereco.get("suburb", "") if isinstance(endereco, dict) else "",
-            endereco.get("city", endereco.get("town", endereco.get("village", ""))) if isinstance(endereco, dict) else "",
-            endereco.get("state", "") if isinstance(endereco, dict) else "",
-            endereco.get("country", "") if isinstance(endereco, dict) else "",
-        ]
-        # keep only non-empty strings
-        clean = [p.strip() for p in parts if p and isinstance(p, str) and p.strip()]
-        local_str = ", ".join(clean)
-        return local_str
-    except Exception:
-        return ""
-
-
-def parse_objectid(value, name: str = 'id'):
-    """Tenta converter uma string para bson.ObjectId.
-
-    Se a conversão falhar, lança HTTPException 400 com mensagem clara.
-    """
-    if value is None:
-        raise HTTPException(status_code=400, detail=f'{name} is required')
-    try:
-        if isinstance(value, ObjectId):
-            return value
-        # allow bytes or str
-        return ObjectId(str(value))
-    except Exception:
-        raise HTTPException(status_code=400, detail=f'Invalid {name}: not a valid ObjectId')
-
-# helper refatorado: ver glb_orchestrator.generate_glb_internal
-
 @app.get("/api/conteudo-signed-url")
 async def get_conteudo_signed_url(gs_url: str = Query(...), filename: str = Query(None)):
     url = gerar_signed_url_conteudo(gs_url, filename)
     return {"signed_url": url}
-
-
-@app.get('/api/get-modelo-para-conteudo')
-async def get_modelo_para_conteudo(contentId: str = Query(None), owner_uid: str = Query(None)):
-    """
-    Retorna um signed URL para um modelo RA relacionado a um conteúdo.
-    Procura primeiro por documentos em 'modelos_ra' com campo contentId igual ao informado.
-    Se não encontrar, tenta retornar o modelo mais recente do owner_uid (se informado).
-    """
-    try:
-        coll = db.get_collection('modelos_ra')
-        query = {}
-        if contentId:
-            query['contentId'] = contentId
-        if not query and owner_uid:
-            query['owner_uid'] = owner_uid
-
-        if not query:
-            raise HTTPException(status_code=400, detail='contentId ou owner_uid requerido')
-
-        # Prefer the most recent model for this content/owner
-        doc = await coll.find(query).sort('created_at', -1).limit(1).to_list(length=1)
-        if doc and len(doc) > 0:
-            d = doc[0]
-            gs = d.get('gs_path')
-            if gs:
-                signed = gerar_signed_url_conteudo(gs, None)
-                # make returned metadata JSON-serializable (ObjectId, datetime etc.)
-                # Return only simple serializable fields to avoid JSON encoding errors in production
-                logging.debug('Modelo encontrado em modelos_ra; signed URL gerada (ocultada no log).')
-                return {'glb_signed_url': signed, 'gs_path': gs}
-
-        return {'glb_signed_url': None}
-    except Exception as e:
-        logging.exception('Erro ao buscar modelo para conteudo: %s', e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 def initialize_firebase():
     cred_json_str = os.getenv("FIREBASE_CRED_JSON")
@@ -247,33 +150,6 @@ def initialize_firebase():
     except Exception as e:
         logging.error(f"Erro ao inicializar o Firebase: {e}")
         raise
-
-
-def _make_serializable(obj):
-    """Recursively convert Mongo/BSON types into JSON-serializable Python types."""
-    # primitive types
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    # ObjectId -> str
-    if isinstance(obj, ObjectId):
-        return str(obj)
-    # datetime -> isoformat
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    # dict -> map
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            out[k] = _make_serializable(v)
-        return out
-    # list/tuple -> list
-    if isinstance(obj, (list, tuple)):
-        return [_make_serializable(v) for v in obj]
-    # fallback: try str()
-    try:
-        return str(obj)
-    except Exception:
-        return None
 
 def initialize_onnx_session():
     global ort_session
@@ -392,47 +268,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
 )
-
-
-# Global exception handler to ensure error responses always include CORS headers
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    # Log full stack for server-side debugging
-    logging.exception(f"Unhandled exception processing request {request.url}: {exc}")
-    # Choose a sensible CORS origin to return; prefer the first configured origin or wildcard in dev
-    # Prefer echoing the request Origin when allowed (required by browsers). Fallback to
-    # the first configured origin or '*' in dev.
-    try:
-        req_origin = request.headers.get('origin')
-    except Exception:
-        req_origin = None
-
-    origin = None
-    try:
-        if _allow_origins:
-            # if wildcard allowed, use it
-            if any(o.strip() == '*' for o in _allow_origins):
-                origin = '*'
-            # if request origin is among allowed origins, echo it
-            elif req_origin and any(req_origin.strip().lower() == o.strip().lower() for o in _allow_origins):
-                origin = req_origin
-            else:
-                # fallback to first configured origin
-                origin = _allow_origins[0]
-        else:
-            origin = '*'
-    except Exception:
-        origin = '*'
-
-    headers = {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
-    }
-
-    # Return a sanitized JSON response so ObjectId/datetime don't break serialization
-    return SanitizedJSONResponse(status_code=500, content={"detail": "Internal Server Error"}, headers=headers)
 
 async def _search_and_compare_logic(file: UploadFile):
     if not logo_index:
@@ -561,232 +396,155 @@ async def add_logo(
 @app.get('/images')
 async def get_images(ownerId: str = None):
     logging.info(f"ownerId recebido: '{ownerId}'")
-    # If DB / collection not yet initialized (startup not complete), return an empty list
-    # instead of raising an exception which can result in a 500 without CORS headers
-    # IMPORTANT: don't test Motor/Mongo Collection objects with truthiness (they raise)
-    if globals().get('logos_collection') is None:
-        logging.warning('logos_collection não inicializada; retornando lista vazia para evitar 500 em produção/dev')
-        return []
-
     filtro = {}
     if ownerId:
         filtro = {"owner_uid": ownerId}
-
-    try:
-        imagens = await logos_collection.find(filtro).to_list(length=100)
-        logging.debug(f"Imagens encontradas: {len(imagens)} registros")
-        # default response class will sanitize BSON types; return raw documents
-        return imagens
-    except Exception as e:
-        logging.exception(f"Erro ao buscar imagens: {e}")
-        # Return a controlled 500 with a simple message (CORS middleware will still add headers)
-        raise HTTPException(status_code=500, detail="Erro interno ao buscar imagens")
+    imagens = await logos_collection.find(filtro).to_list(length=100)
+    logging.info(f"Imagens encontradas: {imagens}")
+    return imagens
 
 
 @app.post('/api/generate-glb-from-image')
-async def api_generate_glb_from_image(payload: dict = Body(...), request: Request = None):
+async def api_generate_glb_from_image(payload: dict = Body(...)):
     """
     Generate a simple GLB from a remote image URL and upload to GCS. Returns signed URL.
     Expects payload: { "image_url": "https://...", "filename": "optional-name.glb" }
     """
     image_url = payload.get('image_url')
+    # Use hash-based filename for stable cache key (avoid re-generating for same image_url)
+    if not image_url:
+        raise HTTPException(status_code=400, detail='image_url required')
+    sha = hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:16]
+    filename = payload.get('filename') or f'generated_{sha}.glb'
     if not image_url:
         raise HTTPException(status_code=400, detail='image_url required')
 
-    # determine owner from Authorization header if present; fallback to 'anonymous'
-    owner_uid = 'anonymous'
+    temp_image = None
+    temp_glb = None
     try:
-        auth_header = None
-        if request:
-            auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
-        if auth_header and auth_header.lower().startswith('bearer '):
-            tok = auth_header.split(' ', 1)[1].strip()
-            try:
-                decoded = auth.verify_id_token(tok)
-                owner_uid = decoded.get('uid') or owner_uid
-            except Exception:
-                owner_uid = 'anonymous'
-    except Exception:
-        owner_uid = 'anonymous'
+        # Configurable limits / whitelist
+        ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv('GLB_ALLOWED_DOMAINS', '').split(',') if d.strip()]
+        MAX_IMAGE_BYTES = int(os.getenv('GLB_MAX_IMAGE_BYTES', '5000000'))  # 5 MB default
+        MAX_IMAGE_DIM = int(os.getenv('GLB_MAX_DIM', '2048'))
 
-    # Delegate the full work to orchestrator (keeps endpoint thin and consistent)
-    provided_filename = payload.get('filename')
-    try:
-        result = await generate_glb_internal(image_url, owner_uid=owner_uid, provided_filename=provided_filename, params=payload, contentId=payload.get('contentId'), db=db)
-        return result
+        # If image_url is a data URL (base64) accept it and write to temp file
+        from urllib.parse import urlparse
+        parsed = None
+        if image_url.startswith('data:'):
+            import base64, re
+            m = re.match(r'data:(image/[^;]+);base64,(.+)', image_url, re.I)
+            if not m:
+                raise HTTPException(status_code=400, detail='Invalid data URL for image')
+            mime = m.group(1).lower()
+            b64 = m.group(2)
+            if not mime.startswith('image'):
+                raise HTTPException(status_code=400, detail='Data URL is not an image')
+            # choose extension
+            if mime in ('image/jpeg', 'image/jpg'):
+                ext = '.jpg'
+            elif mime == 'image/png':
+                ext = '.png'
+            else:
+                # fallback to jpg
+                ext = '.jpg'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+                temp_image = tf.name
+                try:
+                    tf.write(base64.b64decode(b64))
+                except Exception:
+                    raise HTTPException(status_code=400, detail='Failed to decode base64 image')
+        else:
+            parsed = urlparse(image_url)
+            if parsed.scheme not in ('https',):
+                raise HTTPException(status_code=400, detail='image_url must use https scheme')
+            hostname = (parsed.hostname or '').lower()
+            if ALLOWED_DOMAINS and hostname not in ALLOWED_DOMAINS:
+                raise HTTPException(status_code=400, detail='image_url host not allowed')
+
+            # Check cache: does file already exist in GCS?
+            bucket = get_bucket('conteudo')
+            blob = bucket.blob(filename)
+            exists = await asyncio.to_thread(blob.exists)
+            if exists:
+                gcs_path = f'gs://{bucket.name}/{filename}'
+                signed = gerar_signed_url_conteudo(gcs_path, filename)
+                return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }
+
+            # download image with streaming, enforce max bytes
+            async with httpx.AsyncClient(timeout=30.0) as client_http:
+                async with client_http.stream('GET', image_url, follow_redirects=True, timeout=30.0) as resp:
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=400, detail='Failed to download image')
+                    content_type = resp.headers.get('content-type', '')
+                    if not content_type.startswith('image'):
+                        raise HTTPException(status_code=400, detail='URL does not point to an image')
+                    content_length = resp.headers.get('content-length')
+                    if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                        raise HTTPException(status_code=413, detail='Image too large')
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(parsed.path)[1] or '.jpg') as tf:
+                        temp_image = tf.name
+                        total = 0
+                        async for chunk in resp.aiter_bytes():
+                            total += len(chunk)
+                            if total > MAX_IMAGE_BYTES:
+                                raise HTTPException(status_code=413, detail='Image too large')
+                            tf.write(chunk)
+
+        # Resize/normalize image if too big in dimensions (run in thread)
+        def _resize_if_needed(src_path, max_dim):
+            img = PILImage.open(src_path)
+            w, h = img.size
+            if max(w, h) > max_dim:
+                ratio = max_dim / float(max(w, h))
+                new_size = (int(w * ratio), int(h * ratio))
+                img = img.convert('RGB')
+                img = img.resize(new_size, PILImage.LANCZOS)
+                dst = src_path + '.resized.jpg'
+                img.save(dst, format='JPEG', quality=90)
+                return dst
+            return src_path
+
+        processed_image = await asyncio.to_thread(_resize_if_needed, temp_image, MAX_IMAGE_DIM)
+
+        # generate glb
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
+            temp_glb = tg.name
+
+        # run generator in thread to avoid blocking
+        # allow caller to specify base height (meters above ground) via payload.height
+        try:
+            base_height = float(payload.get('height', 0.0))
+        except Exception:
+            base_height = 0.0
+        await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
+
+        # upload to GCS using the stable filename
+        gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')
+        signed = gerar_signed_url_conteudo(gcs_path, filename)
+        return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
     except HTTPException:
         raise
     except Exception as e:
-        logging.exception('Erro gerando GLB (endpoint -> orchestrator): %s', e)
+        logging.exception('Erro gerando GLB: %s', e)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post('/api/upload-modelos-ra')
-@app.post('/api/upload-totem')
-async def upload_totem(file: UploadFile = File(...), contentId: str = Form(None), public: bool = Form(False), token: dict = Depends(verify_firebase_token_dep)):
-    """
-    Upload a .glb to GCS under the authenticated user's namespace and register metadata in 'modelos_ra' (preferred) or 'totems' (fallback).
-    This route is available under both '/api/upload-modelos-ra' and the legacy '/api/upload-totem'.
-    Returns gs_url and a short-lived signed URL for immediate use.
-    """
-    # Deprecation notice: prefer '/api/upload-modelos-ra' going forward.
-    logging.getLogger('uvicorn.access').info('Upload route called (upload-modelos-ra / upload-totem)')
-    owner_uid = token.get('uid') if isinstance(token, dict) else None
-    if not owner_uid:
-        raise HTTPException(status_code=401, detail='Usuário não autenticado')
-
-    MAX_UPLOAD_MB = int(os.getenv('UPLOAD_MAX_MB', '50'))
-    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-
-    # Basic validation on filename/extension
-    orig_name = getattr(file, 'filename', None) or 'upload.glb'
-    lower = orig_name.lower()
-    if not (lower.endswith('.glb') or lower.endswith('.gltf')):
-        raise HTTPException(status_code=400, detail='Apenas arquivos .glb ou .gltf são permitidos')
-
-    # Save to temp file streaming to avoid memory spike
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tf:
-            temp_path = tf.name
-            total = 0
-            # UploadFile.file is a SpooledTemporaryFile; read in chunks
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                tf.write(chunk)
-                total += len(chunk)
-                if total > max_bytes:
-                    raise HTTPException(status_code=413, detail=f'Arquivo excede o limite de {MAX_UPLOAD_MB} MB')
-
-        # Build safe filename and path
-        # slugify basic: keep alnum, dash, underscore
-        import re, hashlib
-        base = re.sub(r'[^0-9a-zA-Z\-_.]', '-', orig_name)
-        short = hashlib.sha1((base + str(datetime.utcnow().timestamp())).encode('utf-8')).hexdigest()[:8]
-        safe_name = f"{owner_uid}/ra/{os.path.splitext(base)[0]}_{short}.glb"
-
-        # Upload to GCS (run in thread)
-        gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_path, safe_name, 'conteudo')
-        signed = gerar_signed_url_conteudo(gcs_path, None)
-
-        # Persist metadata in 'modelos_ra' collection (preferred) falling back to 'totems' if needed
-        doc_id = None
-        try:
-            ra_coll = db.get_collection('modelos_ra')
-            doc = {
-                'owner_uid': owner_uid,
-                'gs_path': gcs_path,
-                'filename': os.path.basename(safe_name),
-                'orig_filename': orig_name,
-                'public': bool(public),
-                'contentId': contentId,
-                'created_at': datetime.utcnow(),
-                'generated_from': 'upload'
-            }
-            res = await ra_coll.insert_one(doc)
-            doc_id = str(res.inserted_id)
-        except Exception:
-            try:
-                totems_coll = db.get_collection('totems')
-                doc = {
-                    'owner_uid': owner_uid,
-                    'gs_path': gcs_path,
-                    'filename': os.path.basename(safe_name),
-                    'orig_filename': orig_name,
-                    'public': bool(public),
-                    'contentId': contentId,
-                    'created_at': datetime.utcnow()
-                }
-                res = await totems_coll.insert_one(doc)
-                doc_id = str(res.inserted_id)
-            except Exception:
-                logging.exception('Falha ao gravar metadados do totem/modelos_ra')
-
-        return {'gs_url': gcs_path, 'glb_signed_url': signed, 'doc_id': doc_id}
     finally:
         try:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+            if temp_image and os.path.exists(temp_image):
+                os.remove(temp_image)
         except Exception:
             pass
-
-
-    @app.post('/api/associate-and-generate-models')
-    async def associate_and_generate_models(payload: dict = Body(...), token: dict = Depends(verify_firebase_token_optional), request: Request = None):
-        """
-        Batch endpoint: recebe um array de imagens (URLs ou data:) em `images` e um optional `contentId`.
-        Para cada imagem gera/upload/persiste o .glb via glb_orchestrator.generate_glb_internal.
-        Retorna o signed URL do totem âncora do usuário (se existir) e a lista de modelos gerados.
-        Exemplo payload: { "images": ["https://.../1.jpg", "data:image/..."], "contentId": "..." }
-        """
-        images = payload.get('images') or []
-        if not images or not isinstance(images, list):
-            raise HTTPException(status_code=400, detail='images array required')
-
-        # determine owner: prefer token.uid, fallback to Authorization header or 'anonymous'
-        owner_uid = 'anonymous'
         try:
-            if isinstance(token, dict) and token.get('uid'):
-                owner_uid = token.get('uid')
-            else:
-                auth_header = None
-                if request:
-                    auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
-                if auth_header and auth_header.lower().startswith('bearer '):
-                    tok = auth_header.split(' ', 1)[1].strip()
-                    try:
-                        decoded = auth.verify_id_token(tok)
-                        owner_uid = decoded.get('uid') or owner_uid
-                    except Exception:
-                        owner_uid = 'anonymous'
+            if temp_glb and os.path.exists(temp_glb):
+                os.remove(temp_glb)
         except Exception:
-            owner_uid = 'anonymous'
-
-        contentId = payload.get('contentId')
-        params = payload.get('params') or payload
-
-        modelos = []
-        # process sequentially to avoid overwhelming CPU/I/O; could be parallelized with semaphore
-        for img in images:
-            try:
-                res = await generate_glb_internal(img, owner_uid=owner_uid, provided_filename=None, params=params, contentId=contentId, db=db)
-                modelos.append(res)
-            except HTTPException as he:
-                # include the error for this image
-                modelos.append({'error': str(he.detail), 'image': img})
-            except Exception as e:
-                modelos.append({'error': str(e), 'image': img})
-
-        # prepare anchor totem signed URL: fixed filename under owner_uid
-        anchor_filename = f"{owner_uid}/ra/HorizontalTotemSelfService_04.glb"
-        bucket = get_bucket('conteudo')
-        anchor_blob = bucket.blob(anchor_filename)
-        try:
-            exists = await asyncio.to_thread(anchor_blob.exists)
-            if exists:
-                anchor_gs = f'gs://{bucket.name}/{anchor_filename}'
-                anchor_signed = gerar_signed_url_conteudo(anchor_gs, anchor_filename)
-            else:
-                anchor_gs = None
-                anchor_signed = None
-        except Exception:
-            anchor_gs = None
-            anchor_signed = None
-
-        return {
-            'anchor_totem': {'glb_signed_url': anchor_signed, 'gs_path': anchor_gs},
-            'modelos': modelos
-        }
+            pass
     
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
     try:
-        object_id = parse_objectid(id, 'id')
-    except HTTPException:
-        raise
+        object_id = ObjectId(id)
     except (InvalidId, TypeError):
         raise HTTPException(status_code=400, detail="ID inválido")
     logo = await logos_collection.find_one({"_id": object_id})
@@ -819,75 +577,6 @@ async def list_users(token: dict = Depends(verify_firebase_token_dep)):
         return users
     except Exception as e:
         print("Erro ao listar usuários:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post('/admin/migrate-modelo')
-async def admin_migrate_modelo(doc_id: str = Body(...), token: dict = Depends(verify_firebase_token_dep)):
-    """
-    Admin endpoint: copia um objeto existente no bucket de conteúdo para o prefixo '{owner_uid}/ra/'
-    e atualiza o documento correspondente em 'modelos_ra'. Requer token com role 'admin'.
-    Input: { "doc_id": "<mongodb-object-id>" }
-    """
-    try:
-        if token.get('role') != 'admin':
-            raise HTTPException(status_code=403, detail='Acesso negado.')
-
-        try:
-            oid = parse_objectid(doc_id, 'doc_id')
-        except HTTPException:
-            raise HTTPException(status_code=400, detail='doc_id inválido')
-
-        coll = db.get_collection('modelos_ra')
-        doc = await coll.find_one({'_id': oid})
-        if not doc:
-            raise HTTPException(status_code=404, detail='Documento não encontrado em modelos_ra')
-
-        gs_path = doc.get('gs_path')
-        owner_uid = doc.get('owner_uid') or doc.get('owner')
-        filename = doc.get('filename') or os.path.basename(gs_path or '')
-
-        if not gs_path or not owner_uid:
-            raise HTTPException(status_code=400, detail='Documento não contém gs_path ou owner_uid')
-
-        # Normalize source path to blob name
-        if gs_path.startswith('gs://'):
-            parts = gs_path[len('gs://'):].split('/', 1)
-            if len(parts) == 2:
-                src_bucket_name, src_blob_name = parts[0], parts[1]
-            else:
-                src_bucket_name = parts[0]
-                src_blob_name = filename
-        else:
-            # fallback: assume it's a blob name
-            src_blob_name = gs_path
-
-        # Destination blob name under owner/ra/
-        dest_blob_name = f"{owner_uid}/ra/{os.path.basename(filename)}"
-
-        # If already correct, just return
-        if src_blob_name == dest_blob_name:
-            return { 'status': 'already_in_place', 'gs_path': gs_path }
-
-        # perform copy within same bucket
-        bucket = get_bucket('conteudo')
-        src_blob = bucket.blob(src_blob_name)
-        # ensure source exists
-        if not src_blob.exists():
-            raise HTTPException(status_code=404, detail=f'Fonte não encontrada no bucket: {src_blob_name}')
-
-        new_blob = bucket.copy_blob(src_blob, bucket, dest_blob_name)
-
-        new_gs = f'gs://{bucket.name}/{dest_blob_name}'
-
-        # update document
-        await coll.update_one({'_id': oid}, {'$set': {'gs_path': new_gs, 'filename': os.path.basename(dest_blob_name)}})
-
-        return {'status': 'migrated', 'old_gs': gs_path, 'new_gs': new_gs}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception('Falha ao migrar modelo: %s', e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/create")
@@ -987,6 +676,7 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
                 if docs and len(docs) > 0:
                     # return the first match along with distance (meters)
                     d0 = docs[0]
+                    d0['_id'] = d0.get('_id')
                     d0['_matched_by'] = 'distance'
                     # dist.calculated is in meters
                     try:
@@ -1018,11 +708,7 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
             if isinstance(marca_id, ObjectId):
                 filtro['marca_id'] = marca_id
             else:
-                try:
-                    filtro['marca_id'] = parse_objectid(marca_id, 'marca_id')
-                except HTTPException:
-                    # if not a valid ObjectId, fallback to string match
-                    filtro['marca_id'] = str(marca_id)
+                filtro['marca_id'] = ObjectId(str(marca_id))
         except Exception:
             filtro['marca_id'] = str(marca_id)
 
@@ -1038,14 +724,8 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
     try:
         # Se marca_id for um ObjectId ou string que represente o _id
         try:
-            try:
-                obj_id = parse_objectid(marca_id, 'marca_id')
-            except HTTPException:
-                obj_id = None
-            if obj_id is not None:
-                marca_doc = await logos_collection.find_one({"_id": obj_id})
-            else:
-                marca_doc = None
+            obj_id = ObjectId(marca_id)
+            marca_doc = await logos_collection.find_one({"_id": obj_id})
         except Exception:
             # marca_id pode já ser um nome ou um string não-convertível
             marca_doc = None
@@ -1070,8 +750,7 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
         "latitude": lat_filter,
         "longitude": lon_filter
     }
-    doc = await db["conteudos"].find_one(filtro3)
-    return doc if doc else None
+    return await db["conteudos"].find_one(filtro3)
 
 async def geocode_reverse(lat, lon):
     url = "https://nominatim.openstreetmap.org/reverse"
@@ -1132,7 +811,14 @@ async def consulta_conteudo(
     endereco = await geocode_reverse(latitude, longitude)
 
     # Monta string do local (exemplo: Rua, Bairro, Cidade, Estado, País)
-    local_str = format_address_string(endereco)
+    local_str = ", ".join([
+        endereco.get("road", ""),
+        endereco.get("suburb", ""),
+        endereco.get("city", endereco.get("town", endereco.get("village", ""))),
+        endereco.get("state", ""),
+        endereco.get("country", "")
+    ])
+    local_str = local_str.strip(", ").replace(",,", ",")
 
     if conteudo:
         # If backend returned a full conteudo document (with blocos), attach signed urls
@@ -1214,7 +900,14 @@ async def get_conteudo(
 
     conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude, radius)
     endereco = await geocode_reverse(latitude, longitude)
-    local_str = format_address_string(endereco)
+    local_str = ", ".join([
+        endereco.get("road", ""),
+        endereco.get("suburb", ""),
+        endereco.get("city", endereco.get("town", endereco.get("village", ""))),
+        endereco.get("state", ""),
+        endereco.get("country", "")
+    ])
+    local_str = local_str.strip(", ").replace(",,", ",")
 
     if conteudo:
         blocos_resp = conteudo.get("blocos", None) if conteudo.get("blocos") else None
