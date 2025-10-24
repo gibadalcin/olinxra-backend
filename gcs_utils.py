@@ -144,5 +144,5 @@ def delete_gs_path(gs_url):
         except Exception:
             return False
     return False
-    
+                    if bucket.name == GCS_BUCKET_LOGOS:
 
