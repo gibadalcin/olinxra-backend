@@ -92,6 +92,56 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+def sanitize_for_json(obj):
+    """Recursively convert common non-JSON-serializable types (ObjectId, numpy types, bytes)
+    into JSON-safe Python types.
+
+    - ObjectId -> str
+    - numpy numbers/arrays -> python numbers / lists
+    - bytes -> decode as utf-8 when possible, otherwise base64
+    - dict/list -> recurse
+    """
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+
+    # ObjectId
+    if isinstance(obj, ObjectId):
+        return str(obj)
+
+    # numpy scalars
+    if _np is not None and isinstance(obj, (_np.generic,)):
+        try:
+            return obj.item()
+        except Exception:
+            return float(obj)
+
+    # numpy arrays
+    if _np is not None and isinstance(obj, _np.ndarray):
+        return obj.tolist()
+
+    # dict -> recurse
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+
+    # list/tuple -> recurse
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+
+    # bytes -> try decode
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return obj.decode('utf-8')
+        except Exception:
+            import base64
+            return base64.b64encode(bytes(obj)).decode('ascii')
+
+    # fallback: primitive types (str, int, float, bool, None)
+    return obj
+
+
 # --- Helpers de Inicialização ---
 ###############################################################
 # Função utilitária e endpoint para gerar signed URL de conteúdo
@@ -401,7 +451,25 @@ async def get_images(ownerId: str = None):
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
     logging.info(f"Imagens encontradas: {imagens}")
-    return imagens
+    try:
+        sanitized = [sanitize_for_json(img) for img in imagens]
+        return sanitized
+    except Exception as e:
+        logging.exception(f"Falha ao sanitizar documentos de imagens: {e}")
+        # Fallback: return minimal representation
+        minimal = []
+        for img in imagens:
+            try:
+                minimal.append({
+                    "id": str(img.get("_id")) if img.get("_id") else None,
+                    "nome": img.get("nome"),
+                    "url": img.get("url"),
+                    "filename": img.get("filename"),
+                    "owner_uid": img.get("owner_uid")
+                })
+            except Exception:
+                continue
+        return minimal
 
 
 @app.post('/api/generate-glb-from-image')
