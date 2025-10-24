@@ -160,10 +160,7 @@ async def get_modelo_para_conteudo(contentId: str = Query(None), owner_uid: str 
             gs = d.get('gs_path')
             if gs:
                 signed = gerar_signed_url_conteudo(gs, None)
-                # make returned metadata JSON-serializable (ObjectId, datetime etc.)
-                # Return only simple serializable fields to avoid JSON encoding errors in production
-                logging.info('Modelo encontrado em modelos_ra; retornando signed URL')
-                return {'glb_signed_url': signed, 'gs_path': gs}
+                return {'glb_signed_url': signed, 'gs_path': gs, 'meta': d}
 
         return {'glb_signed_url': None}
     except Exception as e:
@@ -188,33 +185,6 @@ def initialize_firebase():
     except Exception as e:
         logging.error(f"Erro ao inicializar o Firebase: {e}")
         raise
-
-
-def _make_serializable(obj):
-    """Recursively convert Mongo/BSON types into JSON-serializable Python types."""
-    # primitive types
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    # ObjectId -> str
-    if isinstance(obj, ObjectId):
-        return str(obj)
-    # datetime -> isoformat
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    # dict -> map
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            out[k] = _make_serializable(v)
-        return out
-    # list/tuple -> list
-    if isinstance(obj, (list, tuple)):
-        return [_make_serializable(v) for v in obj]
-    # fallback: try str()
-    try:
-        return str(obj)
-    except Exception:
-        return None
 
 def initialize_onnx_session():
     global ort_session
