@@ -427,44 +427,69 @@ async def api_generate_glb_from_image(payload: dict = Body(...)):
         MAX_IMAGE_BYTES = int(os.getenv('GLB_MAX_IMAGE_BYTES', '5000000'))  # 5 MB default
         MAX_IMAGE_DIM = int(os.getenv('GLB_MAX_DIM', '2048'))
 
-        # If a domain whitelist is set, validate the image_url hostname
+        # If image_url is a data URL (base64) accept it and write to temp file
         from urllib.parse import urlparse
-        parsed = urlparse(image_url)
-        if parsed.scheme not in ('https',):
-            raise HTTPException(status_code=400, detail='image_url must use https scheme')
-        hostname = (parsed.hostname or '').lower()
-        if ALLOWED_DOMAINS and hostname not in ALLOWED_DOMAINS:
-            raise HTTPException(status_code=400, detail='image_url host not allowed')
+        parsed = None
+        if image_url.startswith('data:'):
+            import base64, re
+            m = re.match(r'data:(image/[^;]+);base64,(.+)', image_url, re.I)
+            if not m:
+                raise HTTPException(status_code=400, detail='Invalid data URL for image')
+            mime = m.group(1).lower()
+            b64 = m.group(2)
+            if not mime.startswith('image'):
+                raise HTTPException(status_code=400, detail='Data URL is not an image')
+            # choose extension
+            if mime in ('image/jpeg', 'image/jpg'):
+                ext = '.jpg'
+            elif mime == 'image/png':
+                ext = '.png'
+            else:
+                # fallback to jpg
+                ext = '.jpg'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+                temp_image = tf.name
+                try:
+                    tf.write(base64.b64decode(b64))
+                except Exception:
+                    raise HTTPException(status_code=400, detail='Failed to decode base64 image')
+        else:
+            parsed = urlparse(image_url)
+            if parsed.scheme not in ('https',):
+                raise HTTPException(status_code=400, detail='image_url must use https scheme')
+            hostname = (parsed.hostname or '').lower()
+            if ALLOWED_DOMAINS and hostname not in ALLOWED_DOMAINS:
+                raise HTTPException(status_code=400, detail='image_url host not allowed')
 
-        # Check cache: does file already exist in GCS?
-        bucket = get_bucket('conteudo')
-        blob = bucket.blob(filename)
-        exists = await asyncio.to_thread(blob.exists)
-        if exists:
-            gcs_path = f'gs://{bucket.name}/{filename}'
-            signed = gerar_signed_url_conteudo(gcs_path, filename)
-            return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }
+            # Check cache: does file already exist in GCS?
+            bucket = get_bucket('conteudo')
+            blob = bucket.blob(filename)
+            exists = await asyncio.to_thread(blob.exists)
+            if exists:
+                gcs_path = f'gs://{bucket.name}/{filename}'
+                signed = gerar_signed_url_conteudo(gcs_path, filename)
+                return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }
 
-        # download image with streaming, enforce max bytes
-        async with httpx.AsyncClient(timeout=30.0) as client_http:
-            async with client_http.stream('GET', image_url, follow_redirects=True, timeout=30.0) as resp:
-                if resp.status_code != 200:
-                    raise HTTPException(status_code=400, detail='Failed to download image')
-                content_type = resp.headers.get('content-type', '')
-                if not content_type.startswith('image'):
-                    raise HTTPException(status_code=400, detail='URL does not point to an image')
-                content_length = resp.headers.get('content-length')
-                if content_length and int(content_length) > MAX_IMAGE_BYTES:
-                    raise HTTPException(status_code=413, detail='Image too large')
+            # download image with streaming, enforce max bytes
+            async with httpx.AsyncClient(timeout=30.0) as client_http:
+                async with client_http.stream('GET', image_url, follow_redirects=True, timeout=30.0) as resp:
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=400, detail='Failed to download image')
+                    content_type = resp.headers.get('content-type', '')
+                    if not content_type.startswith('image'):
+                        raise HTTPException(status_code=400, detail='URL does not point to an image')
+                    content_length = resp.headers.get('content-length')
+                    if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                        raise HTTPException(status_code=413, detail='Image too large')
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(parsed.path)[1] or '.jpg') as tf:
-                    temp_image = tf.name
-                    total = 0
-                    async for chunk in resp.aiter_bytes():
-                        total += len(chunk)
-                        if total > MAX_IMAGE_BYTES:
-                            raise HTTPException(status_code=413, detail='Image too large')
-                        tf.write(chunk)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(parsed.path)[1] or '.jpg') as tf:
+                        temp_image = tf.name
+                        total = 0
+                        async for chunk in resp.aiter_bytes():
+                            total += len(chunk)
+                            if total > MAX_IMAGE_BYTES:
+                                raise HTTPException(status_code=413, detail='Image too large')
+                            tf.write(chunk)
 
         # Resize/normalize image if too big in dimensions (run in thread)
         def _resize_if_needed(src_path, max_dim):
