@@ -135,6 +135,43 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return ""
 
+
+def format_address_string(endereco: dict) -> str:
+    """Formata um objeto de endereço retornado por geocode_reverse em uma string legível.
+
+    Mantém apenas partes não vazias e garante pontuação consistente.
+    """
+    try:
+        parts = [
+            endereco.get("road", "") if isinstance(endereco, dict) else "",
+            endereco.get("suburb", "") if isinstance(endereco, dict) else "",
+            endereco.get("city", endereco.get("town", endereco.get("village", ""))) if isinstance(endereco, dict) else "",
+            endereco.get("state", "") if isinstance(endereco, dict) else "",
+            endereco.get("country", "") if isinstance(endereco, dict) else "",
+        ]
+        # keep only non-empty strings
+        clean = [p.strip() for p in parts if p and isinstance(p, str) and p.strip()]
+        local_str = ", ".join(clean)
+        return local_str
+    except Exception:
+        return ""
+
+
+def parse_objectid(value, name: str = 'id'):
+    """Tenta converter uma string para bson.ObjectId.
+
+    Se a conversão falhar, lança HTTPException 400 com mensagem clara.
+    """
+    if value is None:
+        raise HTTPException(status_code=400, detail=f'{name} is required')
+    try:
+        if isinstance(value, ObjectId):
+            return value
+        # allow bytes or str
+        return ObjectId(str(value))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f'Invalid {name}: not a valid ObjectId')
+
 # helper refatorado: ver glb_orchestrator.generate_glb_internal
 
 @app.get("/api/conteudo-signed-url")
@@ -678,7 +715,9 @@ async def upload_totem(file: UploadFile = File(...), contentId: str = Form(None)
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
     try:
-        object_id = ObjectId(id)
+        object_id = parse_objectid(id, 'id')
+    except HTTPException:
+        raise
     except (InvalidId, TypeError):
         raise HTTPException(status_code=400, detail="ID inválido")
     logo = await logos_collection.find_one({"_id": object_id})
@@ -726,8 +765,8 @@ async def admin_migrate_modelo(doc_id: str = Body(...), token: dict = Depends(ve
             raise HTTPException(status_code=403, detail='Acesso negado.')
 
         try:
-            oid = ObjectId(doc_id)
-        except Exception:
+            oid = parse_objectid(doc_id, 'doc_id')
+        except HTTPException:
             raise HTTPException(status_code=400, detail='doc_id inválido')
 
         coll = db.get_collection('modelos_ra')
@@ -911,7 +950,11 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
             if isinstance(marca_id, ObjectId):
                 filtro['marca_id'] = marca_id
             else:
-                filtro['marca_id'] = ObjectId(str(marca_id))
+                try:
+                    filtro['marca_id'] = parse_objectid(marca_id, 'marca_id')
+                except HTTPException:
+                    # if not a valid ObjectId, fallback to string match
+                    filtro['marca_id'] = str(marca_id)
         except Exception:
             filtro['marca_id'] = str(marca_id)
 
@@ -927,8 +970,14 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
     try:
         # Se marca_id for um ObjectId ou string que represente o _id
         try:
-            obj_id = ObjectId(marca_id)
-            marca_doc = await logos_collection.find_one({"_id": obj_id})
+            try:
+                obj_id = parse_objectid(marca_id, 'marca_id')
+            except HTTPException:
+                obj_id = None
+            if obj_id is not None:
+                marca_doc = await logos_collection.find_one({"_id": obj_id})
+            else:
+                marca_doc = None
         except Exception:
             # marca_id pode já ser um nome ou um string não-convertível
             marca_doc = None
@@ -1014,14 +1063,7 @@ async def consulta_conteudo(
     endereco = await geocode_reverse(latitude, longitude)
 
     # Monta string do local (exemplo: Rua, Bairro, Cidade, Estado, País)
-    local_str = ", ".join([
-        endereco.get("road", ""),
-        endereco.get("suburb", ""),
-        endereco.get("city", endereco.get("town", endereco.get("village", ""))),
-        endereco.get("state", ""),
-        endereco.get("country", "")
-    ])
-    local_str = local_str.strip(", ").replace(",,", ",")
+    local_str = format_address_string(endereco)
 
     if conteudo:
         # If backend returned a full conteudo document (with blocos), attach signed urls
@@ -1103,14 +1145,7 @@ async def get_conteudo(
 
     conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude, radius)
     endereco = await geocode_reverse(latitude, longitude)
-    local_str = ", ".join([
-        endereco.get("road", ""),
-        endereco.get("suburb", ""),
-        endereco.get("city", endereco.get("town", endereco.get("village", ""))),
-        endereco.get("state", ""),
-        endereco.get("country", "")
-    ])
-    local_str = local_str.strip(", ").replace(",,", ",")
+    local_str = format_address_string(endereco)
 
     if conteudo:
         blocos_resp = conteudo.get("blocos", None) if conteudo.get("blocos") else None
