@@ -393,28 +393,6 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
-
-# Global exception handler to ensure error responses always include CORS headers
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    # Log full stack for server-side debugging
-    logging.exception(f"Unhandled exception processing request {request.url}: {exc}")
-    # Choose a sensible CORS origin to return; prefer the first configured origin or wildcard in dev
-    try:
-        origin = _allow_origins[0] if _allow_origins else "*"
-    except Exception:
-        origin = "*"
-
-    headers = {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
-    }
-
-    # Return a sanitized JSON response so ObjectId/datetime don't break serialization
-    return SanitizedJSONResponse(status_code=500, content={"detail": "Internal Server Error"}, headers=headers)
-
 async def _search_and_compare_logic(file: UploadFile):
     if not logo_index:
         raise HTTPException(status_code=503, detail="Índice de logos não está pronto.")
