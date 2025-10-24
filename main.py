@@ -596,7 +596,15 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
         # compute deterministic filename using src_hash + params
         params_string = f"{base_height}|{plane_height}|{flip_u}|{flip_v}"
         sha = hashlib.sha256((src_hash + '|' + params_string).encode('utf-8')).hexdigest()[:16]
-        filename = payload.get('filename') or f'{owner_uid}/ra/generated_{sha}.glb'
+        # Respect explicit filename but normalize to ensure owner/ra prefix to avoid root-level uploads.
+        provided_filename = payload.get('filename')
+        if provided_filename:
+            # Use only the basename of provided filename to avoid arbitrary paths and
+            # always store under the authenticated user's namespace: {owner_uid}/ra/
+            safe_base = os.path.basename(provided_filename)
+            filename = f"{owner_uid}/ra/{safe_base}"
+        else:
+            filename = f'{owner_uid}/ra/generated_{sha}.glb'
 
         # Check cache: does file already exist in GCS?
         bucket = get_bucket('conteudo')
