@@ -126,8 +126,8 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
             expiration=3600,
             method="GET"
         )
-    # Log minimal info at DEBUG (do not include full signed URL in logs)
-    logging.debug(f"Signed URL gerada para bucket={tipo_bucket} filename={filename}")
+        # Log minimal info at DEBUG (do not include full signed URL in logs)
+        logging.debug(f"Signed URL gerada para bucket={tipo_bucket} filename={filename}")
         return url
     except Exception as e:
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
