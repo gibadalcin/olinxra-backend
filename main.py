@@ -469,7 +469,7 @@ async def get_images(ownerId: str = None):
     if ownerId:
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
-        logging.info(f"Imagens encontradas: {imagens}")
+    logging.info(f"Imagens encontradas: {imagens}")
     return imagens
 
 
