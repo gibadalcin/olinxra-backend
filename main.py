@@ -451,6 +451,22 @@ async def get_images(ownerId: str = None):
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
     logging.info(f"Imagens encontradas: {imagens}")
+
+    # Attach signed_url for any GCS paths so the frontend can load images via HTTPS
+    try:
+        for img in imagens:
+            try:
+                url = img.get('url') if isinstance(img, dict) else None
+                if isinstance(url, str) and url.startswith('gs://'):
+                    # generate signed url in thread to avoid blocking
+                    signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, img.get('filename'))
+                    if signed:
+                        img['signed_url'] = signed
+            except Exception:
+                # don't fail the whole request for signing errors
+                continue
+    except Exception:
+        logging.exception('Erro ao anexar signed_url às imagens')
     try:
         sanitized = [sanitize_for_json(img) for img in imagens]
         return sanitized
