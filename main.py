@@ -563,8 +563,7 @@ async def get_images(ownerId: str = None):
     logging.info(f"ownerId recebido: '{ownerId}'")
     # If DB / collection not yet initialized (startup not complete), return an empty list
     # instead of raising an exception which can result in a 500 without CORS headers
-    # IMPORTANT: don't test Motor/Mongo Collection objects with truthiness (they raise)
-    if globals().get('logos_collection') is None:
+    if not globals().get('logos_collection'):
         logging.warning('logos_collection não inicializada; retornando lista vazia para evitar 500 em produção/dev')
         return []
 
