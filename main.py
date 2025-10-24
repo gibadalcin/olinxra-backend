@@ -20,6 +20,8 @@ from bson.errors import InvalidId
 from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs, get_bucket, storage_client
 from glb_generator import generate_plane_glb
+# refatorado: use orchestrator centralizado para geração/upload/persistência de GLB
+from glb_orchestrator import generate_glb_internal
 from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
@@ -132,6 +134,9 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
     except Exception as e:
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return ""
+
+
+# helper refatorado: ver glb_orchestrator.generate_glb_internal
 
 @app.get("/api/conteudo-signed-url")
 async def get_conteudo_signed_url(gs_url: str = Query(...), filename: str = Query(None)):
@@ -483,18 +488,6 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
     if not image_url:
         raise HTTPException(status_code=400, detail='image_url required')
 
-    # read params that affect generated model identity
-    try:
-        plane_height = float(payload.get('plane_height', payload.get('planeHeight', 1.0)))
-    except Exception:
-        plane_height = 1.0
-    try:
-        base_height = float(payload.get('height', 0.0))
-    except Exception:
-        base_height = 0.0
-    flip_u = bool(payload.get('flip_u', payload.get('flipU', True)))
-    flip_v = bool(payload.get('flip_v', payload.get('flipV', True)))
-
     # determine owner from Authorization header if present; fallback to 'anonymous'
     owner_uid = 'anonymous'
     try:
@@ -507,163 +500,20 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
                 decoded = auth.verify_id_token(tok)
                 owner_uid = decoded.get('uid') or owner_uid
             except Exception:
-                # invalid token -> treat as anonymous
                 owner_uid = 'anonymous'
     except Exception:
         owner_uid = 'anonymous'
 
-    temp_image = None
-    temp_glb = None
+    # Delegate the full work to orchestrator (keeps endpoint thin and consistent)
+    provided_filename = payload.get('filename')
     try:
-        # Configurable limits / whitelist
-        ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv('GLB_ALLOWED_DOMAINS', '').split(',') if d.strip()]
-        MAX_IMAGE_BYTES = int(os.getenv('GLB_MAX_IMAGE_BYTES', '5000000'))  # 5 MB default
-        MAX_IMAGE_DIM = int(os.getenv('GLB_MAX_DIM', '2048'))
-
-        # If image_url is a data URL (base64) accept it and write to temp file
-        from urllib.parse import urlparse
-        parsed = None
-        import base64, re
-        if image_url.startswith('data:'):
-            m = re.match(r'data:(image/[^;]+);base64,(.+)', image_url, re.I)
-            if not m:
-                raise HTTPException(status_code=400, detail='Invalid data URL for image')
-            mime = m.group(1).lower()
-            b64 = m.group(2)
-            if not mime.startswith('image'):
-                raise HTTPException(status_code=400, detail='Data URL is not an image')
-            # compute source hash from image bytes
-            try:
-                img_bytes = base64.b64decode(b64)
-            except Exception:
-                raise HTTPException(status_code=400, detail='Failed to decode base64 image')
-            src_hash = hashlib.sha256(img_bytes).hexdigest()
-            # choose extension
-            if mime in ('image/jpeg', 'image/jpg'):
-                ext = '.jpg'
-            elif mime == 'image/png':
-                ext = '.png'
-            else:
-                # fallback to jpg
-                ext = '.jpg'
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
-                temp_image = tf.name
-                tf.write(img_bytes)
-        else:
-            parsed = urlparse(image_url)
-            if parsed.scheme not in ('https',):
-                raise HTTPException(status_code=400, detail='image_url must use https scheme')
-            hostname = (parsed.hostname or '').lower()
-            if ALLOWED_DOMAINS and hostname not in ALLOWED_DOMAINS:
-                raise HTTPException(status_code=400, detail='image_url host not allowed')
-
-            # For URL sources compute src_hash deterministically from the URL string
-            src_hash = hashlib.sha256(image_url.encode('utf-8')).hexdigest()
-
-            # download image with streaming, enforce max bytes
-            async with httpx.AsyncClient(timeout=30.0) as client_http:
-                async with client_http.stream('GET', image_url, follow_redirects=True, timeout=30.0) as resp:
-                    if resp.status_code != 200:
-                        raise HTTPException(status_code=400, detail='Failed to download image')
-                    content_type = resp.headers.get('content-type', '')
-                    if not content_type.startswith('image'):
-                        raise HTTPException(status_code=400, detail='URL does not point to an image')
-                    content_length = resp.headers.get('content-length')
-                    if content_length and int(content_length) > MAX_IMAGE_BYTES:
-                        raise HTTPException(status_code=413, detail='Image too large')
-
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(parsed.path)[1] or '.jpg') as tf:
-                        temp_image = tf.name
-                        total = 0
-                        async for chunk in resp.aiter_bytes():
-                            total += len(chunk)
-                            if total > MAX_IMAGE_BYTES:
-                                raise HTTPException(status_code=413, detail='Image too large')
-                            tf.write(chunk)
-
-        # Resize/normalize image if too big in dimensions (run in thread)
-        def _resize_if_needed(src_path, max_dim):
-            img = PILImage.open(src_path)
-            w, h = img.size
-            if max(w, h) > max_dim:
-                ratio = max_dim / float(max(w, h))
-                new_size = (int(w * ratio), int(h * ratio))
-                img = img.convert('RGB')
-                img = img.resize(new_size, PILImage.LANCZOS)
-                dst = src_path + '.resized.jpg'
-                img.save(dst, format='JPEG', quality=90)
-                return dst
-            return src_path
-
-        processed_image = await asyncio.to_thread(_resize_if_needed, temp_image, MAX_IMAGE_DIM)
-
-        # compute deterministic filename using src_hash + params
-        params_string = f"{base_height}|{plane_height}|{flip_u}|{flip_v}"
-        sha = hashlib.sha256((src_hash + '|' + params_string).encode('utf-8')).hexdigest()[:16]
-        # Respect explicit filename but normalize to ensure owner/ra prefix to avoid root-level uploads.
-        provided_filename = payload.get('filename')
-        if provided_filename:
-            # Use only the basename of provided filename to avoid arbitrary paths and
-            # always store under the authenticated user's namespace: {owner_uid}/ra/
-            safe_base = os.path.basename(provided_filename)
-            filename = f"{owner_uid}/ra/{safe_base}"
-        else:
-            filename = f'{owner_uid}/ra/generated_{sha}.glb'
-
-        # Check cache: does file already exist in GCS?
-        bucket = get_bucket('conteudo')
-        blob = bucket.blob(filename)
-        exists = await asyncio.to_thread(blob.exists)
-        if exists:
-            gcs_path = f'gs://{bucket.name}/{filename}'
-            signed = gerar_signed_url_conteudo(gcs_path, filename)
-            return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }
-
-        # generate glb
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
-            temp_glb = tg.name
-
-        # run generator in thread to avoid blocking
-        await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height, plane_height, flip_u, flip_v)
-
-        # upload to GCS using the stable filename (under owner/ra/)
-        gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')
-        signed = gerar_signed_url_conteudo(gcs_path, filename)
-
-        # persist minimal metadata in modelos_ra collection (if available)
-        try:
-            ra_coll = db.get_collection('modelos_ra')
-            doc = {
-                'owner_uid': owner_uid,
-                'gs_path': gcs_path,
-                'filename': os.path.basename(filename),
-                'source': {'type': 'data' if image_url.startswith('data:') else 'url', 'value': src_hash if image_url.startswith('data:') else image_url},
-                'params': {'height': base_height, 'plane_height': plane_height, 'flip_u': flip_u, 'flip_v': flip_v},
-                'public': False,
-                'created_at': datetime.utcnow()
-            }
-            await ra_coll.insert_one(doc)
-        except Exception:
-            # ignore persistence errors; generation/upload succeeded
-            pass
-
-        return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
+        result = await generate_glb_internal(image_url, owner_uid=owner_uid, provided_filename=provided_filename, params=payload, contentId=payload.get('contentId'), db=db)
+        return result
     except HTTPException:
         raise
     except Exception as e:
-        logging.exception('Erro gerando GLB: %s', e)
+        logging.exception('Erro gerando GLB (endpoint -> orchestrator): %s', e)
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            if temp_image and os.path.exists(temp_image):
-                os.remove(temp_image)
-        except Exception:
-            pass
-        try:
-            if temp_glb and os.path.exists(temp_glb):
-                os.remove(temp_glb)
-        except Exception:
-            pass
 
 
 @app.post('/api/upload-modelos-ra')
@@ -756,6 +606,74 @@ async def upload_totem(file: UploadFile = File(...), contentId: str = Form(None)
                 os.remove(temp_path)
         except Exception:
             pass
+
+
+    @app.post('/api/associate-and-generate-models')
+    async def associate_and_generate_models(payload: dict = Body(...), token: dict = Depends(verify_firebase_token_dep), request: Request = None):
+        """
+        Batch endpoint: recebe um array de imagens (URLs ou data:) em `images` e um optional `contentId`.
+        Para cada imagem gera/upload/persiste o .glb via glb_orchestrator.generate_glb_internal.
+        Retorna o signed URL do totem âncora do usuário (se existir) e a lista de modelos gerados.
+        Exemplo payload: { "images": ["https://.../1.jpg", "data:image/..."], "contentId": "..." }
+        """
+        images = payload.get('images') or []
+        if not images or not isinstance(images, list):
+            raise HTTPException(status_code=400, detail='images array required')
+
+        # determine owner: prefer token.uid, fallback to Authorization header or 'anonymous'
+        owner_uid = 'anonymous'
+        try:
+            if isinstance(token, dict) and token.get('uid'):
+                owner_uid = token.get('uid')
+            else:
+                auth_header = None
+                if request:
+                    auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
+                if auth_header and auth_header.lower().startswith('bearer '):
+                    tok = auth_header.split(' ', 1)[1].strip()
+                    try:
+                        decoded = auth.verify_id_token(tok)
+                        owner_uid = decoded.get('uid') or owner_uid
+                    except Exception:
+                        owner_uid = 'anonymous'
+        except Exception:
+            owner_uid = 'anonymous'
+
+        contentId = payload.get('contentId')
+        params = payload.get('params') or payload
+
+        modelos = []
+        # process sequentially to avoid overwhelming CPU/I/O; could be parallelized with semaphore
+        for img in images:
+            try:
+                res = await generate_glb_internal(img, owner_uid=owner_uid, provided_filename=None, params=params, contentId=contentId, db=db)
+                modelos.append(res)
+            except HTTPException as he:
+                # include the error for this image
+                modelos.append({'error': str(he.detail), 'image': img})
+            except Exception as e:
+                modelos.append({'error': str(e), 'image': img})
+
+        # prepare anchor totem signed URL: fixed filename under owner_uid
+        anchor_filename = f"{owner_uid}/ra/HorizontalTotemSelfService_04.glb"
+        bucket = get_bucket('conteudo')
+        anchor_blob = bucket.blob(anchor_filename)
+        try:
+            exists = await asyncio.to_thread(anchor_blob.exists)
+            if exists:
+                anchor_gs = f'gs://{bucket.name}/{anchor_filename}'
+                anchor_signed = gerar_signed_url_conteudo(anchor_gs, anchor_filename)
+            else:
+                anchor_gs = None
+                anchor_signed = None
+        except Exception:
+            anchor_gs = None
+            anchor_signed = None
+
+        return {
+            'anchor_totem': {'glb_signed_url': anchor_signed, 'gs_path': anchor_gs},
+            'modelos': modelos
+        }
     
 
 @app.delete('/delete-logo/')
