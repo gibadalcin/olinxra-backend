@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
         # Índice simples por owner_uid
         await db['conteudos'].create_index([('owner_uid', 1)], name='idx_owner_uid')
 
-    logging.debug('Índices de conteúdo verificados/criados com sucesso.')
+        logging.debug('Índices de conteúdo verificados/criados com sucesso.')
     except Exception as e:
         logging.exception(f'Falha ao criar índices em conteudos: {e}')
     # REMOVIDO: images_collection = db["images"]
@@ -469,7 +469,7 @@ async def get_images(ownerId: str = None):
     if ownerId:
         filtro = {"owner_uid": ownerId}
     imagens = await logos_collection.find(filtro).to_list(length=100)
-    logging.info(f"Imagens encontradas: {imagens}")
+        logging.info(f"Imagens encontradas: {imagens}")
     return imagens
 
 
