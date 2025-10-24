@@ -122,8 +122,6 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
             expiration=3600,
             method="GET"
         )
-        # Log successful generation for debugging
-        logging.info(f"Signed URL gerada para bucket={tipo_bucket} filename={filename} -> {url}")
         return url
     except Exception as e:
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
@@ -133,39 +131,6 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
 async def get_conteudo_signed_url(gs_url: str = Query(...), filename: str = Query(None)):
     url = gerar_signed_url_conteudo(gs_url, filename)
     return {"signed_url": url}
-
-
-@app.get('/api/get-modelo-para-conteudo')
-async def get_modelo_para_conteudo(contentId: str = Query(None), owner_uid: str = Query(None)):
-    """
-    Retorna um signed URL para um modelo RA relacionado a um conteúdo.
-    Procura primeiro por documentos em 'modelos_ra' com campo contentId igual ao informado.
-    Se não encontrar, tenta retornar o modelo mais recente do owner_uid (se informado).
-    """
-    try:
-        coll = db.get_collection('modelos_ra')
-        query = {}
-        if contentId:
-            query['contentId'] = contentId
-        if not query and owner_uid:
-            query['owner_uid'] = owner_uid
-
-        if not query:
-            raise HTTPException(status_code=400, detail='contentId ou owner_uid requerido')
-
-        # Prefer the most recent model for this content/owner
-        doc = await coll.find(query).sort('created_at', -1).limit(1).to_list(length=1)
-        if doc and len(doc) > 0:
-            d = doc[0]
-            gs = d.get('gs_path')
-            if gs:
-                signed = gerar_signed_url_conteudo(gs, None)
-                return {'glb_signed_url': signed, 'gs_path': gs, 'meta': d}
-
-        return {'glb_signed_url': None}
-    except Exception as e:
-        logging.exception('Erro ao buscar modelo para conteudo: %s', e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 def initialize_firebase():
     cred_json_str = os.getenv("FIREBASE_CRED_JSON")
