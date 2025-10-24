@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
-from gcs_utils import upload_image_to_gcs, get_bucket
+from gcs_utils import upload_image_to_gcs, get_bucket, storage_client
 from glb_generator import generate_plane_glb
 from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
@@ -30,7 +30,11 @@ from PIL import Image as PILImage
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
+# Reduce noisy logs from third-party libraries
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('google.cloud').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 load_dotenv()
 
 
@@ -77,12 +81,12 @@ async def lifespan(app: FastAPI):
         # Índice simples por owner_uid
         await db['conteudos'].create_index([('owner_uid', 1)], name='idx_owner_uid')
 
-        logging.info('Índices de conteúdo verificados/criados com sucesso.')
+    logging.debug('Índices de conteúdo verificados/criados com sucesso.')
     except Exception as e:
         logging.exception(f'Falha ao criar índices em conteudos: {e}')
     # REMOVIDO: images_collection = db["images"]
 
-    logging.info("Iniciando a aplicação...")
+    logging.debug("Iniciando a aplicação...")
     initialize_firebase()
     initialize_onnx_session()
     await load_faiss_index()
@@ -122,8 +126,8 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
             expiration=3600,
             method="GET"
         )
-        # Log successful generation for debugging
-        logging.info(f"Signed URL gerada para bucket={tipo_bucket} filename={filename} -> {url}")
+    # Log minimal info at DEBUG (do not include full signed URL in logs)
+    logging.debug(f"Signed URL gerada para bucket={tipo_bucket} filename={filename}")
         return url
     except Exception as e:
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
@@ -162,7 +166,7 @@ async def get_modelo_para_conteudo(contentId: str = Query(None), owner_uid: str 
                 signed = gerar_signed_url_conteudo(gs, None)
                 # make returned metadata JSON-serializable (ObjectId, datetime etc.)
                 # Return only simple serializable fields to avoid JSON encoding errors in production
-                logging.info('Modelo encontrado em modelos_ra; retornando signed URL')
+                logging.debug('Modelo encontrado em modelos_ra; signed URL gerada (ocultada no log).')
                 return {'glb_signed_url': signed, 'gs_path': gs}
 
         return {'glb_signed_url': None}
@@ -790,6 +794,75 @@ async def list_users(token: dict = Depends(verify_firebase_token_dep)):
         return users
     except Exception as e:
         print("Erro ao listar usuários:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/admin/migrate-modelo')
+async def admin_migrate_modelo(doc_id: str = Body(...), token: dict = Depends(verify_firebase_token_dep)):
+    """
+    Admin endpoint: copia um objeto existente no bucket de conteúdo para o prefixo '{owner_uid}/ra/'
+    e atualiza o documento correspondente em 'modelos_ra'. Requer token com role 'admin'.
+    Input: { "doc_id": "<mongodb-object-id>" }
+    """
+    try:
+        if token.get('role') != 'admin':
+            raise HTTPException(status_code=403, detail='Acesso negado.')
+
+        try:
+            oid = ObjectId(doc_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail='doc_id inválido')
+
+        coll = db.get_collection('modelos_ra')
+        doc = await coll.find_one({'_id': oid})
+        if not doc:
+            raise HTTPException(status_code=404, detail='Documento não encontrado em modelos_ra')
+
+        gs_path = doc.get('gs_path')
+        owner_uid = doc.get('owner_uid') or doc.get('owner')
+        filename = doc.get('filename') or os.path.basename(gs_path or '')
+
+        if not gs_path or not owner_uid:
+            raise HTTPException(status_code=400, detail='Documento não contém gs_path ou owner_uid')
+
+        # Normalize source path to blob name
+        if gs_path.startswith('gs://'):
+            parts = gs_path[len('gs://'):].split('/', 1)
+            if len(parts) == 2:
+                src_bucket_name, src_blob_name = parts[0], parts[1]
+            else:
+                src_bucket_name = parts[0]
+                src_blob_name = filename
+        else:
+            # fallback: assume it's a blob name
+            src_blob_name = gs_path
+
+        # Destination blob name under owner/ra/
+        dest_blob_name = f"{owner_uid}/ra/{os.path.basename(filename)}"
+
+        # If already correct, just return
+        if src_blob_name == dest_blob_name:
+            return { 'status': 'already_in_place', 'gs_path': gs_path }
+
+        # perform copy within same bucket
+        bucket = get_bucket('conteudo')
+        src_blob = bucket.blob(src_blob_name)
+        # ensure source exists
+        if not src_blob.exists():
+            raise HTTPException(status_code=404, detail=f'Fonte não encontrada no bucket: {src_blob_name}')
+
+        new_blob = bucket.copy_blob(src_blob, bucket, dest_blob_name)
+
+        new_gs = f'gs://{bucket.name}/{dest_blob_name}'
+
+        # update document
+        await coll.update_one({'_id': oid}, {'$set': {'gs_path': new_gs, 'filename': os.path.basename(dest_blob_name)}})
+
+        return {'status': 'migrated', 'old_gs': gs_path, 'new_gs': new_gs}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception('Falha ao migrar modelo: %s', e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/create")
