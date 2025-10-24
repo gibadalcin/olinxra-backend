@@ -512,7 +512,12 @@ async def api_generate_glb_from_image(payload: dict = Body(...)):
             temp_glb = tg.name
 
         # run generator in thread to avoid blocking
-        await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb)
+        # allow caller to specify base height (meters above ground) via payload.height
+        try:
+            base_height = float(payload.get('height', 0.0))
+        except Exception:
+            base_height = 0.0
+        await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
 
         # upload to GCS using the stable filename
         gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')

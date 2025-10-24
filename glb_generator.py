@@ -21,7 +21,7 @@ def _min_max_positions(positions):
     return [min(xs), min(ys), min(zs)], [max(xs), max(ys), max(zs)]
 
 
-def generate_plane_glb(image_path: str, output_glb_path: str) -> None:
+def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.0, plane_height: float = 1.0, flip_u: bool = True, flip_v: bool = True) -> None:
     """
     Generate a simple GLB file with a single textured quad using the provided image as the texture.
     The plane is placed upright (standing) with its base on the ground plane.
@@ -32,17 +32,30 @@ def generate_plane_glb(image_path: str, output_glb_path: str) -> None:
         image_bytes = f.read()
 
     # Simple plane geometry (4 vertices)
-    # Vertices: bottom-left, bottom-right, top-left, top-right (so base sits on Y=0)
+    # Vertices: bottom-left, bottom-right, top-left, top-right
+    # base_y controls the base position on the Y axis (so base_y=2 -> plane sits 2 meters above ground)
+    bottom_y = float(base_y)
+    top_y = bottom_y + float(plane_height)
     positions = [
-        -0.5, 0.0, 0.0,   # bottom-left
-         0.5, 0.0, 0.0,   # bottom-right
-        -0.5, 1.0, 0.0,   # top-left
-         0.5, 1.0, 0.0,   # top-right
+        -0.5, bottom_y, 0.0,   # bottom-left
+         0.5, bottom_y, 0.0,   # bottom-right
+        -0.5, top_y,    0.0,   # top-left
+         0.5, top_y,    0.0,   # top-right
     ]
     # Normals pointing forward along +Z so the texture faces the viewer when placed at Z=0
     normals = [0.0, 0.0, 1.0] * 4
-    # UVs: (u,v) for bottom-left, bottom-right, top-left, top-right
-    uvs = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    # UVs base: (u,v) for bottom-left, bottom-right, top-left, top-right
+    base_uvs = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    # Apply optional flips to correct orientation (some viewers/images require flipping)
+    uvs = []
+    for i in range(0, len(base_uvs), 2):
+        u = base_uvs[i]
+        v = base_uvs[i+1]
+        if flip_u:
+            u = 1.0 - u
+        if flip_v:
+            v = 1.0 - v
+        uvs.extend([u, v])
     indices = [0, 1, 2, 1, 3, 2]
 
     pos_bytes = _pack_floats(positions)
