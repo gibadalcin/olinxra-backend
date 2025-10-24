@@ -400,29 +400,10 @@ async def global_exception_handler(request: Request, exc: Exception):
     # Log full stack for server-side debugging
     logging.exception(f"Unhandled exception processing request {request.url}: {exc}")
     # Choose a sensible CORS origin to return; prefer the first configured origin or wildcard in dev
-    # Prefer echoing the request Origin when allowed (required by browsers). Fallback to
-    # the first configured origin or '*' in dev.
     try:
-        req_origin = request.headers.get('origin')
+        origin = _allow_origins[0] if _allow_origins else "*"
     except Exception:
-        req_origin = None
-
-    origin = None
-    try:
-        if _allow_origins:
-            # if wildcard allowed, use it
-            if any(o.strip() == '*' for o in _allow_origins):
-                origin = '*'
-            # if request origin is among allowed origins, echo it
-            elif req_origin and any(req_origin.strip().lower() == o.strip().lower() for o in _allow_origins):
-                origin = req_origin
-            else:
-                # fallback to first configured origin
-                origin = _allow_origins[0]
-        else:
-            origin = '*'
-    except Exception:
-        origin = '*'
+        origin = "*"
 
     headers = {
         "Access-Control-Allow-Origin": origin,
