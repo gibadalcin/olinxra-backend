@@ -174,13 +174,37 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
         )
         return url
     except Exception as e:
-        logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
-        return ""
+        logging.exception(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket})")
+        return None
 
 @app.get("/api/conteudo-signed-url")
 async def get_conteudo_signed_url(gs_url: str = Query(...), filename: str = Query(None)):
     url = gerar_signed_url_conteudo(gs_url, filename)
     return {"signed_url": url}
+
+
+@app.post('/api/conteudo-signed-urls')
+async def get_conteudo_signed_urls(payload: dict = Body(...)):
+    """Batch endpoint. Expects JSON: { "gs_urls": ["gs://...", ...] }
+    Returns: { "signed_urls": { "gs://...": "https://...", ... } }
+    """
+    gs_urls = payload.get('gs_urls') if isinstance(payload, dict) else None
+    if not gs_urls or not isinstance(gs_urls, list):
+        raise HTTPException(status_code=400, detail='gs_urls must be a list')
+    result = {}
+    try:
+        tasks = [asyncio.to_thread(gerar_signed_url_conteudo, u, None) for u in gs_urls]
+        signed_list = await asyncio.gather(*tasks, return_exceptions=True)
+        for orig, signed in zip(gs_urls, signed_list):
+            if isinstance(signed, Exception):
+                logging.exception(f"Error generating signed url for {orig}: {signed}")
+                result[orig] = None
+            else:
+                result[orig] = signed
+        return { 'signed_urls': result }
+    except Exception as e:
+        logging.exception(f"Failed to generate batch signed urls: {e}")
+        raise HTTPException(status_code=500, detail='Failed to generate signed urls')
 
 def initialize_firebase():
     cred_json_str = os.getenv("FIREBASE_CRED_JSON")
@@ -457,14 +481,21 @@ async def get_images(ownerId: str = None):
         for img in imagens:
             try:
                 url = img.get('url') if isinstance(img, dict) else None
+                signed = None
                 if isinstance(url, str) and url.startswith('gs://'):
                     # generate signed url in thread to avoid blocking
                     signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, img.get('filename'))
-                    if signed:
-                        img['signed_url'] = signed
-            except Exception:
-                # don't fail the whole request for signing errors
-                continue
+                    if not signed:
+                        logging.warning(f"Could not generate signed_url for {url} (id={img.get('_id')})")
+                # always set field (may be None) so frontend can rely on its presence
+                img['signed_url'] = signed
+            except Exception as e:
+                logging.exception(f"Unexpected error while processing image for signed_url: {e}")
+                # ensure signed_url field exists even in case of per-item error
+                try:
+                    img['signed_url'] = None
+                except Exception:
+                    pass
     except Exception:
         logging.exception('Erro ao anexar signed_url às imagens')
     try:
