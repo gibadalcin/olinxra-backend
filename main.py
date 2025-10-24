@@ -520,27 +520,25 @@ async def add_logo(
 @app.get('/images')
 async def get_images(ownerId: str = None):
     logging.info(f"ownerId recebido: '{ownerId}'")
+    # If DB / collection not yet initialized (startup not complete), return an empty list
+    # instead of raising an exception which can result in a 500 without CORS headers
+    if not globals().get('logos_collection'):
+        logging.warning('logos_collection não inicializada; retornando lista vazia para evitar 500 em produção/dev')
+        return []
+
     filtro = {}
     if ownerId:
         filtro = {"owner_uid": ownerId}
-    imagens = await logos_collection.find(filtro).to_list(length=100)
-    logging.info(f"Imagens encontradas: {imagens}")
-    # Ensure BSON types (ObjectId, datetime) are converted to JSON-serializable types
+
     try:
+        imagens = await logos_collection.find(filtro).to_list(length=100)
+        logging.debug(f"Imagens encontradas: {len(imagens)} registros")
         # default response class will sanitize BSON types; return raw documents
         return imagens
-    except Exception:
-        # Fallback: stringify ObjectId fields
-        out = []
-        for doc in imagens:
-            try:
-                out.append(doc)
-            except Exception:
-                # last resort: convert _id to str and return
-                if isinstance(doc, dict) and doc.get('_id'):
-                    doc['_id'] = str(doc['_id'])
-                out.append(doc)
-        return out
+    except Exception as e:
+        logging.exception(f"Erro ao buscar imagens: {e}")
+        # Return a controlled 500 with a simple message (CORS middleware will still add headers)
+        raise HTTPException(status_code=500, detail="Erro interno ao buscar imagens")
 
 
 @app.post('/api/generate-glb-from-image')
