@@ -24,21 +24,25 @@ def _min_max_positions(positions):
 def generate_plane_glb(image_path: str, output_glb_path: str) -> None:
     """
     Generate a simple GLB file with a single textured quad using the provided image as the texture.
-    The plane is centered at origin, size 1x1 on X-Z plane (Y up).
+    The plane is placed upright (standing) with its base on the ground plane.
+    Coordinates: X across, Y up, Z forward. The quad covers X in [-0.5,0.5] and Y in [0,1], at Z=0.
     """
     # Read image bytes
     with open(image_path, 'rb') as f:
         image_bytes = f.read()
 
     # Simple plane geometry (4 vertices)
+    # Vertices: bottom-left, bottom-right, top-left, top-right (so base sits on Y=0)
     positions = [
-        -0.5, 0.0, 0.5,
-         0.5, 0.0, 0.5,
-        -0.5, 0.0, -0.5,
-         0.5, 0.0, -0.5,
+        -0.5, 0.0, 0.0,   # bottom-left
+         0.5, 0.0, 0.0,   # bottom-right
+        -0.5, 1.0, 0.0,   # top-left
+         0.5, 1.0, 0.0,   # top-right
     ]
-    normals = [0.0, 1.0, 0.0] * 4
-    uvs = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+    # Normals pointing forward along +Z so the texture faces the viewer when placed at Z=0
+    normals = [0.0, 0.0, 1.0] * 4
+    # UVs: (u,v) for bottom-left, bottom-right, top-left, top-right
+    uvs = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
     indices = [0, 1, 2, 1, 3, 2]
 
     pos_bytes = _pack_floats(positions)
