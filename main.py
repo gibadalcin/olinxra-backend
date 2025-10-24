@@ -135,7 +135,6 @@ def gerar_signed_url_conteudo(gs_url, filename=None):
         logging.error(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return ""
 
-
 # helper refatorado: ver glb_orchestrator.generate_glb_internal
 
 @app.get("/api/conteudo-signed-url")
@@ -608,72 +607,72 @@ async def upload_totem(file: UploadFile = File(...), contentId: str = Form(None)
             pass
 
 
-@app.post('/api/associate-and-generate-models')
-async def associate_and_generate_models(payload: dict = Body(...), token: dict = Depends(verify_firebase_token_dep), request: Request = None):
-    """
-    Batch endpoint: recebe um array de imagens (URLs ou data:) em `images` e um optional `contentId`.
-    Para cada imagem gera/upload/persiste o .glb via glb_orchestrator.generate_glb_internal.
-    Retorna o signed URL do totem âncora do usuário (se existir) e a lista de modelos gerados.
-    Exemplo payload: { "images": ["https://.../1.jpg", "data:image/..."], "contentId": "..." }
-    """
-    images = payload.get('images') or []
-    if not images or not isinstance(images, list):
-        raise HTTPException(status_code=400, detail='images array required')
+    @app.post('/api/associate-and-generate-models')
+    async def associate_and_generate_models(payload: dict = Body(...), token: dict = Depends(verify_firebase_token_optional), request: Request = None):
+        """
+        Batch endpoint: recebe um array de imagens (URLs ou data:) em `images` e um optional `contentId`.
+        Para cada imagem gera/upload/persiste o .glb via glb_orchestrator.generate_glb_internal.
+        Retorna o signed URL do totem âncora do usuário (se existir) e a lista de modelos gerados.
+        Exemplo payload: { "images": ["https://.../1.jpg", "data:image/..."], "contentId": "..." }
+        """
+        images = payload.get('images') or []
+        if not images or not isinstance(images, list):
+            raise HTTPException(status_code=400, detail='images array required')
 
-    # determine owner: prefer token.uid, fallback to Authorization header or 'anonymous'
-    owner_uid = 'anonymous'
-    try:
-        if isinstance(token, dict) and token.get('uid'):
-            owner_uid = token.get('uid')
-        else:
-            auth_header = None
-            if request:
-                auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
-            if auth_header and auth_header.lower().startswith('bearer '):
-                tok = auth_header.split(' ', 1)[1].strip()
-                try:
-                    decoded = auth.verify_id_token(tok)
-                    owner_uid = decoded.get('uid') or owner_uid
-                except Exception:
-                    owner_uid = 'anonymous'
-    except Exception:
+        # determine owner: prefer token.uid, fallback to Authorization header or 'anonymous'
         owner_uid = 'anonymous'
-
-    contentId = payload.get('contentId')
-    params = payload.get('params') or payload
-
-    modelos = []
-    # process sequentially to avoid overwhelming CPU/I/O; could be parallelized with semaphore
-    for img in images:
         try:
-            res = await generate_glb_internal(img, owner_uid=owner_uid, provided_filename=None, params=params, contentId=contentId, db=db)
-            modelos.append(res)
-        except HTTPException as he:
-            # include the error for this image
-            modelos.append({'error': str(he.detail), 'image': img})
-        except Exception as e:
-            modelos.append({'error': str(e), 'image': img})
+            if isinstance(token, dict) and token.get('uid'):
+                owner_uid = token.get('uid')
+            else:
+                auth_header = None
+                if request:
+                    auth_header = request.headers.get('authorization') or request.headers.get('Authorization')
+                if auth_header and auth_header.lower().startswith('bearer '):
+                    tok = auth_header.split(' ', 1)[1].strip()
+                    try:
+                        decoded = auth.verify_id_token(tok)
+                        owner_uid = decoded.get('uid') or owner_uid
+                    except Exception:
+                        owner_uid = 'anonymous'
+        except Exception:
+            owner_uid = 'anonymous'
 
-    # prepare anchor totem signed URL: fixed filename under owner_uid
-    anchor_filename = f"{owner_uid}/ra/HorizontalTotemSelfService_04.glb"
-    bucket = get_bucket('conteudo')
-    anchor_blob = bucket.blob(anchor_filename)
-    try:
-        exists = await asyncio.to_thread(anchor_blob.exists)
-        if exists:
-            anchor_gs = f'gs://{bucket.name}/{anchor_filename}'
-            anchor_signed = gerar_signed_url_conteudo(anchor_gs, anchor_filename)
-        else:
+        contentId = payload.get('contentId')
+        params = payload.get('params') or payload
+
+        modelos = []
+        # process sequentially to avoid overwhelming CPU/I/O; could be parallelized with semaphore
+        for img in images:
+            try:
+                res = await generate_glb_internal(img, owner_uid=owner_uid, provided_filename=None, params=params, contentId=contentId, db=db)
+                modelos.append(res)
+            except HTTPException as he:
+                # include the error for this image
+                modelos.append({'error': str(he.detail), 'image': img})
+            except Exception as e:
+                modelos.append({'error': str(e), 'image': img})
+
+        # prepare anchor totem signed URL: fixed filename under owner_uid
+        anchor_filename = f"{owner_uid}/ra/HorizontalTotemSelfService_04.glb"
+        bucket = get_bucket('conteudo')
+        anchor_blob = bucket.blob(anchor_filename)
+        try:
+            exists = await asyncio.to_thread(anchor_blob.exists)
+            if exists:
+                anchor_gs = f'gs://{bucket.name}/{anchor_filename}'
+                anchor_signed = gerar_signed_url_conteudo(anchor_gs, anchor_filename)
+            else:
+                anchor_gs = None
+                anchor_signed = None
+        except Exception:
             anchor_gs = None
             anchor_signed = None
-    except Exception:
-        anchor_gs = None
-        anchor_signed = None
 
-    return {
-        'anchor_totem': {'glb_signed_url': anchor_signed, 'gs_path': anchor_gs},
-        'modelos': modelos
-    }
+        return {
+            'anchor_totem': {'glb_signed_url': anchor_signed, 'gs_path': anchor_gs},
+            'modelos': modelos
+        }
     
 
 @app.delete('/delete-logo/')
