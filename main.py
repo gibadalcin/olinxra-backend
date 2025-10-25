@@ -19,6 +19,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs, get_bucket
+from google.api_core.exceptions import PreconditionFailed
 from glb_generator import generate_plane_glb
 from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
@@ -690,22 +691,63 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
 
         processed_image = await asyncio.to_thread(_resize_if_needed, temp_image, MAX_IMAGE_DIM)
 
-        # generate glb
+        # generate glb (but first try to acquire a lightweight generation lock/marker
+        # to avoid multiple processes doing the expensive generation concurrently)
         with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
             temp_glb = tg.name
 
-        # run generator in thread to avoid blocking
-        # allow caller to specify base height (meters above ground) via payload.height
-        try:
-            base_height = float(payload.get('height', 0.0))
-        except Exception:
-            base_height = 0.0
-        await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
+        marker_name = f"{filename}.generating"
+        marker_blob = bucket.blob(marker_name)
+        we_are_owner = False
 
-        # upload to GCS using the stable filename
-        gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')
-        signed = gerar_signed_url_conteudo(gcs_path, filename)
-        return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
+        try:
+            # Try to create the marker atomically: only the first creator will succeed.
+            await asyncio.to_thread(marker_blob.upload_from_string, "", if_generation_match=0)
+            we_are_owner = True
+            logging.info("[generate-glb] acquired generation marker %s", marker_name)
+        except PreconditionFailed:
+            # Another process created the marker first.
+            logging.info("[generate-glb] generation marker already exists (another process is generating): %s", marker_name)
+        except Exception as e:
+            # Unexpected error creating marker; log and proceed (we'll still try to generate)
+            logging.exception("[generate-glb] unexpected error creating generation marker %s: %s", marker_name, e)
+
+        # If we didn't acquire the marker, wait for the other process to finish generating
+        if not we_are_owner:
+            wait_seconds = int(os.getenv('GLB_GENERATION_WAIT_SECONDS', '30'))
+            waited = 0.0
+            interval = 0.5
+            while waited < wait_seconds:
+                exists = await asyncio.to_thread(blob.exists)
+                if exists:
+                    gcs_path = f'gs://{bucket.name}/{filename}'
+                    signed = gerar_signed_url_conteudo(gcs_path, filename)
+                    return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }
+                await asyncio.sleep(interval)
+                waited += interval
+            logging.info("[generate-glb] timeout waiting for concurrent generation; proceeding to generate: %s", filename)
+
+        try:
+            # run generator in thread to avoid blocking
+            # allow caller to specify base height (meters above ground) via payload.height
+            try:
+                base_height = float(payload.get('height', 0.0))
+            except Exception:
+                base_height = 0.0
+            await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
+
+            # upload to GCS using the stable filename
+            gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')
+            signed = gerar_signed_url_conteudo(gcs_path, filename)
+            return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
+        finally:
+            # Clean up the marker if we created it so future requests don't wait unnecessarily.
+            if we_are_owner:
+                try:
+                    await asyncio.to_thread(marker_blob.delete)
+                    logging.info("[generate-glb] removed generation marker %s", marker_name)
+                except Exception as e:
+                    logging.exception("[generate-glb] failed to remove generation marker %s: %s", marker_name, e)
     except HTTPException:
         raise
     except Exception as e:
