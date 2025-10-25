@@ -520,11 +520,29 @@ async def get_images(ownerId: str = None):
 
 
 @app.post('/api/generate-glb-from-image')
-async def api_generate_glb_from_image(payload: dict = Body(...)):
+async def api_generate_glb_from_image(payload: dict = Body(...), request: Request = None):
     """
     Generate a simple GLB from a remote image URL and upload to GCS. Returns signed URL.
     Expects payload: { "image_url": "https://...", "filename": "optional-name.glb" }
     """
+    # Optional runtime guard: require Firebase auth to request signed URLs
+    GLB_REQUIRE_AUTH = os.getenv('GLB_REQUIRE_AUTH', 'false').lower() == 'true'
+    decoded_token = None
+    if GLB_REQUIRE_AUTH:
+        # Expect Authorization: Bearer <idToken>
+        auth_header = None
+        try:
+            auth_header = request.headers.get('authorization') if request and request.headers else None
+        except Exception:
+            auth_header = None
+        if not auth_header or not isinstance(auth_header, str) or not auth_header.lower().startswith('bearer '):
+            raise HTTPException(status_code=401, detail='Authorization header required')
+        idtoken = auth_header.split(' ', 1)[1]
+        try:
+            decoded_token = auth.verify_id_token(idtoken)
+        except Exception:
+            raise HTTPException(status_code=401, detail='Invalid or expired Firebase token')
+
     image_url = payload.get('image_url')
     # Use hash-based filename for stable cache key (avoid re-generating for same image_url)
     if not image_url:
