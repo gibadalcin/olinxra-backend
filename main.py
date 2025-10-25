@@ -530,9 +530,38 @@ async def api_generate_glb_from_image(payload: dict = Body(...)):
     if not image_url:
         raise HTTPException(status_code=400, detail='image_url required')
     sha = hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:16]
-    filename = payload.get('filename') or f'generated_{sha}.glb'
-    if not image_url:
-        raise HTTPException(status_code=400, detail='image_url required')
+    base_filename = f'generated_{sha}.glb'
+
+    # Determine owner prefix (if provided) and compose final filename inside the 'conteudo' bucket
+    owner_uid = None
+    try:
+        owner_uid = payload.get('owner_uid') or payload.get('owner') or payload.get('ownerUid')
+    except Exception:
+        owner_uid = None
+
+    provided_filename = None
+    try:
+        provided_filename = payload.get('filename')
+    except Exception:
+        provided_filename = None
+
+    # If a filename was provided by the caller, respect it. If it is a simple name (no prefix),
+    # and owner_uid is present, place it under {owner_uid}/ra/models/. Otherwise, if no filename
+    # provided, create a generated name under the owner-specific prefix or under public/ra/models.
+    if provided_filename and isinstance(provided_filename, str) and provided_filename.strip() != "":
+        # avoid double-prefixing: if provided_filename already looks like a path, use as-is
+        if '/' in provided_filename:
+            filename = provided_filename
+        else:
+            if owner_uid:
+                filename = f"{owner_uid}/ra/models/{provided_filename}"
+            else:
+                filename = f"public/ra/models/{provided_filename}"
+    else:
+        if owner_uid:
+            filename = f"{owner_uid}/ra/models/{base_filename}"
+        else:
+            filename = f"public/ra/models/{base_filename}"
 
     temp_image = None
     temp_glb = None
