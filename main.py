@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
-from gcs_utils import upload_image_to_gcs, get_bucket
+from gcs_utils import upload_image_to_gcs, get_bucket, GCS_BUCKET_CONTEUDO, GCS_BUCKET_LOGOS
 from google.api_core.exceptions import PreconditionFailed
 from glb_generator import generate_plane_glb
 from pygltflib import GLTF2
@@ -147,40 +147,63 @@ def sanitize_for_json(obj):
 # --- Helpers de Inicialização ---
 ###############################################################
 # Função utilitária e endpoint para gerar signed URL de conteúdo
-def gerar_signed_url_conteudo(gs_url, filename=None):
-    # Detecta bucket pelo prefixo ou filename
-    tipo_bucket = "conteudo"
-    if gs_url.startswith("gs://olinxra-logos/"):
-        tipo_bucket = "logos"
-    elif gs_url.startswith("gs://olinxra-conteudo/"):
-        tipo_bucket = "conteudo"
-    elif filename and "conteudo" in filename:
-        tipo_bucket = "conteudo"
-    else:
-        tipo_bucket = "logos"
-    # Extrai o caminho completo após o nome do bucket se não informado
-    if not filename:
-        if gs_url.startswith("gs://olinxra-conteudo/"):
-            filename = gs_url[len("gs://olinxra-conteudo/"):]
-        elif gs_url.startswith("gs://olinxra-logos/"):
-            filename = gs_url[len("gs://olinxra-logos/"):]
-        else:
-            # fallback: tenta pegar o nome do arquivo (última parte do path)
-            filename = gs_url.split("/")[-1]
+def gerar_signed_url_conteudo(gs_url=None, filename=None):
+    """
+    Gera um signed URL para um objeto no bucket de conteúdo ou logos.
+    Aceita dois modos de chamada:
+    - gs_url (ex: 'gs://bucket/path/file.glb') OR
+    - filename (ex: 'public/ra/totem/file.glb') — neste caso assumimos bucket de conteúdo.
+    """
     try:
-        bucket = get_bucket(tipo_bucket)
+        # Determine bucket names from gcs_utils (loaded from env)
+        bucket_conteudo = GCS_BUCKET_CONTEUDO
+        bucket_logos = GCS_BUCKET_LOGOS
+
+        tipo_bucket = 'conteudo'
+
+        # If a full gs_url was provided, infer the bucket by its prefix
+        if gs_url and isinstance(gs_url, str):
+            if bucket_logos and gs_url.startswith(f'gs://{bucket_logos}/'):
+                tipo_bucket = 'logos'
+            elif bucket_conteudo and gs_url.startswith(f'gs://{bucket_conteudo}/'):
+                tipo_bucket = 'conteudo'
+            else:
+                # fallback: if filename contains 'conteudo', prefer conteudo
+                if filename and 'conteudo' in filename:
+                    tipo_bucket = 'conteudo'
+                else:
+                    tipo_bucket = 'logos' if bucket_logos else 'conteudo'
+
+        # If no filename given, try to extract from gs_url
+        if not filename:
+            if gs_url and isinstance(gs_url, str) and gs_url.startswith('gs://'):
+                # remove gs://bucket/
+                parts = gs_url.split('/', 3)
+                if len(parts) >= 4:
+                    filename = parts[3]
+                else:
+                    filename = gs_url.split('/')[-1]
+            else:
+                # fallback: use last path segment of provided string
+                filename = (filename or '')
+
+        bucket = get_bucket('conteudo' if tipo_bucket == 'conteudo' else 'logos')
         url = bucket.blob(filename).generate_signed_url(
-            version="v4",
+            version='v4',
             expiration=3600,
-            method="GET"
+            method='GET'
         )
         return url
     except Exception as e:
-        logging.exception(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket})")
+        logging.exception(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return None
 
 @app.get("/api/conteudo-signed-url")
-async def get_conteudo_signed_url(gs_url: str = Query(...), filename: str = Query(None)):
+async def get_conteudo_signed_url(gs_url: str = Query(None), filename: str = Query(None)):
+    """
+    Retorna um signed URL. Aceita ou um gs_url completo (gs://bucket/path) ou apenas `filename`.
+    Prefer `filename` quando o cliente não deve saber o nome do bucket.
+    """
     url = gerar_signed_url_conteudo(gs_url, filename)
     return {"signed_url": url}
 
@@ -293,7 +316,8 @@ async def attach_signed_urls_to_blocos(blocos):
                         url = it.get('url') or (it.get('meta') and it['meta'].get('url'))
                         filename = it.get('filename') or (it.get('meta') and it['meta'].get('filename'))
                         if not url and filename:
-                            url = f"gs://olinxra-conteudo/{filename}"
+                            # Compose a gs:// URL using the configured content bucket from env
+                            url = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
                         if url:
                             signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, filename)
                             if signed:
@@ -305,7 +329,7 @@ async def attach_signed_urls_to_blocos(blocos):
             url = b.get('url')
             filename = b.get('filename')
             if not url and filename:
-                url = f"gs://olinxra-conteudo/{filename}"
+                url = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
             if url:
                 try:
                     signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, filename)
@@ -1520,7 +1544,7 @@ async def post_conteudo(
                 if is_media and (not b.get('url')) and b.get('filename'):
                     filename = b.get('filename')
                     if not str(filename).startswith('gs://'):
-                        b['url'] = f"gs://olinxra-conteudo/{filename}"
+                        b['url'] = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
 
                 # If this is a carousel (has items), persist tipoSelecionado and normalize items
                 if b.get('items') and isinstance(b.get('items'), list) and len(b.get('items')) > 0:
@@ -1565,7 +1589,7 @@ async def post_conteudo(
                         filename = f"{owner}/{nome}"
                     b['filename'] = filename
                     if not b.get('url'):
-                        b['url'] = f"gs://olinxra-conteudo/{filename}"
+                        b['url'] = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
             except Exception:
                 # keep going; post-processing must not fail the whole request
                 pass
