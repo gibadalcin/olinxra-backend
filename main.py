@@ -21,6 +21,7 @@ from datetime import timedelta, datetime
 from gcs_utils import upload_image_to_gcs, get_bucket
 from google.api_core.exceptions import PreconditionFailed
 from glb_generator import generate_plane_glb
+from pygltflib import GLTF2
 from schemas import validate_button_block_payload
 from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
@@ -743,8 +744,9 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
                 base_height = 0.0
             await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
 
-            # upload to GCS using the stable filename
-            gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo')
+            # upload to GCS using the stable filename (set cache-control + metadata)
+            metadata = { 'generated_from_image': image_url, 'base_height': str(base_height) }
+            gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo', 'public, max-age=31536000', metadata)
             signed = gerar_signed_url_conteudo(gcs_path, filename)
             return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
         finally:
@@ -772,6 +774,120 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
         except Exception:
             pass
     
+
+
+@app.post('/api/transform-glb')
+async def api_transform_glb(payload: dict = Body(...)):
+    """
+    Transform an existing GLB stored in GCS by applying a uniform scale and/or translation to all scene nodes.
+    Expects JSON payload: { "gs_url": "gs://bucket/path/file.glb", "scale": 0.8, "translate": [0, -0.2, 0], "filename": "optional/output.glb" }
+    Returns: { "glb_signed_url": "https://...", "gs_url": "gs://..." }
+    """
+    gs_url = payload.get('gs_url')
+    if not gs_url or not isinstance(gs_url, str) or not gs_url.startswith('gs://'):
+        raise HTTPException(status_code=400, detail='gs_url (gs://...) required')
+
+    # Parse gs://bucket/path
+    without = gs_url[len('gs://'):]
+    parts = without.split('/', 1)
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail='gs_url must include bucket and path')
+    bucket_name, blob_path = parts[0], parts[1]
+
+    try:
+        # download to temp
+        import tempfile
+        from gcs_utils import storage_client
+
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        if not await asyncio.to_thread(blob.exists):
+            raise HTTPException(status_code=404, detail='Source GLB not found in GCS')
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tf_in:
+            in_path = tf_in.name
+        await asyncio.to_thread(blob.download_to_filename, in_path)
+
+        # load and modify in thread (pygltflib operations are sync/blocking)
+        scale = payload.get('scale')
+        translate = payload.get('translate')
+
+        def _transform(infile, outfile, scale_val, translate_val):
+            g = GLTF2().load(infile)
+            # ensure nodes list exists
+            if not g.nodes:
+                g.nodes = []
+            for n in g.nodes:
+                # apply uniform scale
+                try:
+                    if scale_val is not None:
+                        s = float(scale_val)
+                        if getattr(n, 'scale', None):
+                            # multiply existing scale
+                            try:
+                                n.scale = [float(n.scale[0]) * s, float(n.scale[1]) * s, float(n.scale[2]) * s]
+                            except Exception:
+                                n.scale = [s, s, s]
+                        else:
+                            n.scale = [s, s, s]
+                    # apply translation (additive)
+                    if translate_val is not None:
+                        tx, ty, tz = [float(x) for x in translate_val]
+                        if getattr(n, 'translation', None):
+                            try:
+                                n.translation = [float(n.translation[0]) + tx, float(n.translation[1]) + ty, float(n.translation[2]) + tz]
+                            except Exception:
+                                n.translation = [tx, ty, tz]
+                        else:
+                            n.translation = [tx, ty, tz]
+                except Exception:
+                    # per-node errors shouldn't abort whole transform
+                    continue
+            # Save binary GLB preserving buffers
+            # load_binary/save_binary methods handle the binary blob
+            g.save_binary(outfile)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tf_out:
+            out_path = tf_out.name
+
+        await asyncio.to_thread(_transform, in_path, out_path, scale, translate)
+
+        # compose output filename for upload
+        provided = payload.get('filename')
+        if provided and isinstance(provided, str) and provided.strip() != '':
+            filename = provided
+        else:
+            # derive from source path: keep same directory and add suffix
+            src_name = os.path.basename(blob_path)
+            name_only, ext = os.path.splitext(src_name)
+            sval = f"s{scale}" if scale is not None else "s1"
+            tval = f"t{translate[1]}" if (translate and len(translate) > 1) else "t0"
+            filename = os.path.join(os.path.dirname(blob_path), f"{name_only}_{sval}_{tval}.glb")
+
+    # upload with cache-control and metadata so the generated GLB is cacheable
+    metadata = { 'generated_from': blob_path, 'transform': json.dumps({'scale': scale, 'translate': translate}) }
+    gcs_path = await asyncio.to_thread(upload_image_to_gcs, out_path, filename, 'conteudo', 'public, max-age=31536000', metadata)
+    signed = gerar_signed_url_conteudo(gcs_path, filename)
+
+        return { 'glb_signed_url': signed, 'gs_url': gcs_path }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception('Failed to transform GLB: %s', e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if 'in_path' in locals() and os.path.exists(in_path):
+                os.remove(in_path)
+        except Exception:
+            pass
+        try:
+            if 'out_path' in locals() and os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):

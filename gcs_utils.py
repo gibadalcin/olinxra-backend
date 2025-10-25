@@ -38,7 +38,7 @@ def get_bucket(tipo="logos"):
     return storage_client.bucket(bucket_name)
 
 
-def upload_image_to_gcs(local_path, filename, tipo):
+def upload_image_to_gcs(local_path, filename, tipo, cache_control=None, metadata=None):
     """
     Faz o upload de um arquivo local para o Google Cloud Storage no bucket correto.
 
@@ -74,26 +74,49 @@ def upload_image_to_gcs(local_path, filename, tipo):
                      local_path, filename, bucket.name, tipo)
     except Exception:
         pass
-
     blob = bucket.blob(filename)
     gcs_url = f"gs://{bucket.name}/{filename}"
 
-    # Try to upload with a generation precondition to avoid race conditions
-    # If another writer created the object concurrently, the precondition will
-    # fail and we should treat it as a cache hit (object already exists).
+    # Apply cache control or metadata if provided so uploads are cacheable by CDN/clients
     try:
-        logging.info("[gcs_utils] attempting upload with if_generation_match=0 for %s", gcs_url)
-        blob.upload_from_filename(local_path, if_generation_match=0)
-        logging.info("[gcs_utils] upload successful: %s", gcs_url)
-        return gcs_url
-    except PreconditionFailed:
-        # Another process created the blob concurrently. Treat as success.
-        logging.info("[gcs_utils] PreconditionFailed: object already exists (created by another process): %s", gcs_url)
-        return gcs_url
-    except Exception as e:
-        # For unexpected errors, log and re-raise so caller can handle.
-        logging.exception("[gcs_utils] upload failed for %s: %s", gcs_url, e)
-        raise
+        if cache_control:
+            try:
+                blob.cache_control = cache_control
+            except Exception:
+                pass
+        if metadata and isinstance(metadata, dict):
+            try:
+                blob.metadata = metadata
+            except Exception:
+                pass
+
+        # Try to upload with a generation precondition to avoid race conditions
+        # If another writer created the object concurrently, the precondition will
+        # fail and we should treat it as a cache hit (object already exists).
+        try:
+            logging.info("[gcs_utils] attempting upload with if_generation_match=0 for %s", gcs_url)
+            # upload_from_filename will persist blob.cache_control and blob.metadata if set above
+            blob.upload_from_filename(local_path, if_generation_match=0)
+            logging.info("[gcs_utils] upload successful: %s", gcs_url)
+            return gcs_url
+        except PreconditionFailed:
+            # Another process created the blob concurrently. Treat as success.
+            logging.info("[gcs_utils] PreconditionFailed: object already exists (created by another process): %s", gcs_url)
+            return gcs_url
+        except Exception as e:
+            # For unexpected errors, log and re-raise so caller can handle.
+            logging.exception("[gcs_utils] upload failed for %s: %s", gcs_url, e)
+            raise
+    finally:
+        # Ensure we try to flush metadata changes (best-effort)
+        try:
+            if hasattr(blob, 'patch'):
+                try:
+                    blob.patch()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def delete_file(filename, tipo="conteudo"):
