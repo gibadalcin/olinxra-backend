@@ -696,6 +696,13 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
         with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
             temp_glb = tg.name
 
+        # Ensure we have a bucket reference (may not be set if image_url was a data: URL)
+        try:
+            bucket
+        except NameError:
+            bucket = get_bucket('conteudo')
+            blob = bucket.blob(filename)
+
         marker_name = f"{filename}.generating"
         marker_blob = bucket.blob(marker_name)
         we_are_owner = False
