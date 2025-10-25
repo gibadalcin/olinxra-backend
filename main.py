@@ -864,10 +864,10 @@ async def api_transform_glb(payload: dict = Body(...)):
             tval = f"t{translate[1]}" if (translate and len(translate) > 1) else "t0"
             filename = os.path.join(os.path.dirname(blob_path), f"{name_only}_{sval}_{tval}.glb")
 
-    # upload with cache-control and metadata so the generated GLB is cacheable
-    metadata = { 'generated_from': blob_path, 'transform': json.dumps({'scale': scale, 'translate': translate}) }
-    gcs_path = await asyncio.to_thread(upload_image_to_gcs, out_path, filename, 'conteudo', 'public, max-age=31536000', metadata)
-    signed = gerar_signed_url_conteudo(gcs_path, filename)
+        # upload with cache-control and metadata so the generated GLB is cacheable
+        metadata = { 'generated_from': blob_path, 'transform': json.dumps({'scale': scale, 'translate': translate}) }
+        gcs_path = await asyncio.to_thread(upload_image_to_gcs, out_path, filename, 'conteudo', 'public, max-age=31536000', metadata)
+        signed = gerar_signed_url_conteudo(gcs_path, filename)
 
         return { 'glb_signed_url': signed, 'gs_url': gcs_path }
 
