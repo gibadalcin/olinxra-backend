@@ -626,8 +626,29 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
             # Check cache: does file already exist in GCS?
             bucket = get_bucket('conteudo')
             blob = bucket.blob(filename)
+            # Diagnostic log: before checking existence
+            logging.info(
+                "[generate-glb] checking existence in GCS before blob.exists: bucket=%s filename=%s owner_uid=%s base_filename=%s image_url=%s",
+                bucket.name,
+                filename,
+                owner_uid,
+                base_filename,
+                (image_url[:200] + '...') if isinstance(image_url, str) and len(image_url) > 200 else image_url,
+            )
             exists = await asyncio.to_thread(blob.exists)
+            # Diagnostic log: after checking existence
+            logging.info(
+                "[generate-glb] blob.exists result: %s for gs://%s/%s",
+                exists,
+                bucket.name,
+                filename,
+            )
             if exists:
+                logging.info(
+                    "[generate-glb] cache hit - returning signed URL without regenerating: gs://%s/%s",
+                    bucket.name,
+                    filename,
+                )
                 gcs_path = f'gs://{bucket.name}/{filename}'
                 signed = gerar_signed_url_conteudo(gcs_path, filename)
                 return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': True }

@@ -1,8 +1,9 @@
 
 import os
 import json
+import logging
 from google.cloud import storage
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import NotFound, PreconditionFailed
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -69,14 +70,30 @@ def upload_image_to_gcs(local_path, filename, tipo):
 
     # Log útil para debug em runtime (mas não exponha segredos)
     try:
-        print(f"[gcs_utils] Uploading file '{filename}' to bucket '{bucket.name}' (tipo={tipo})")
+        logging.info("[gcs_utils] Upload requested: local_path=%s filename=%s bucket=%s tipo=%s",
+                     local_path, filename, bucket.name, tipo)
     except Exception:
         pass
 
     blob = bucket.blob(filename)
-    blob.upload_from_filename(local_path)
     gcs_url = f"gs://{bucket.name}/{filename}"
-    return gcs_url
+
+    # Try to upload with a generation precondition to avoid race conditions
+    # If another writer created the object concurrently, the precondition will
+    # fail and we should treat it as a cache hit (object already exists).
+    try:
+        logging.info("[gcs_utils] attempting upload with if_generation_match=0 for %s", gcs_url)
+        blob.upload_from_filename(local_path, if_generation_match=0)
+        logging.info("[gcs_utils] upload successful: %s", gcs_url)
+        return gcs_url
+    except PreconditionFailed:
+        # Another process created the blob concurrently. Treat as success.
+        logging.info("[gcs_utils] PreconditionFailed: object already exists (created by another process): %s", gcs_url)
+        return gcs_url
+    except Exception as e:
+        # For unexpected errors, log and re-raise so caller can handle.
+        logging.exception("[gcs_utils] upload failed for %s: %s", gcs_url, e)
+        raise
 
 
 def delete_file(filename, tipo="conteudo"):
