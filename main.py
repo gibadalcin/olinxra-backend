@@ -769,7 +769,21 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
             await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
 
             # upload to GCS using the stable filename (set cache-control + metadata)
-            metadata = { 'generated_from_image': image_url, 'base_height': str(base_height) }
+            # Guardar apenas um identificador/sumário da origem da imagem nos metadados
+            # porque imagens embutidas (data:) ou URLs longas podem exceder o limite
+            # permitido para a parte de metadata no upload multipart do GCS.
+            try:
+                gen_from = image_url
+                if isinstance(gen_from, str) and gen_from.startswith('data:'):
+                    # não armazenar toda a base64 nos metadados — ótima forma é guardar apenas o tamanho
+                    gen_from = f"data:base64(length={len(gen_from)})"
+                elif isinstance(gen_from, str) and len(gen_from) > 512:
+                    # truncar URLs muito longas para evitar metadados enormes
+                    gen_from = gen_from[:512] + '...'
+            except Exception:
+                gen_from = None
+
+            metadata = { 'generated_from_image': gen_from or 'unknown', 'base_height': str(base_height) }
             gcs_path = await asyncio.to_thread(upload_image_to_gcs, temp_glb, filename, 'conteudo', 'public, max-age=31536000', metadata)
             signed = gerar_signed_url_conteudo(gcs_path, filename)
             return { 'glb_signed_url': signed, 'gs_url': gcs_path, 'cached': False }
