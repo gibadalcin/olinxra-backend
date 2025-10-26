@@ -188,52 +188,52 @@ def gerar_signed_url_conteudo(gs_url=None, filename=None):
                 filename = (filename or '')
 
         bucket = get_bucket('conteudo' if tipo_bucket == 'conteudo' else 'logos')
-            blob = bucket.blob(filename)
-            # Verify object exists before returning a signed URL. Generating a
-            # signed URL for a non-existent object will produce a 404 when used
-            # by clients and makes debugging harder. Check existence and return
-            # None if absent so the caller can handle it explicitly.
-            try:
-                if not blob.exists():
-                    logging.info(f"Requested signed URL for non-existent object: gs://{bucket.name}/{filename}")
-                    # Server-side fallback: if the filename looks like a transformed
-                    # variant (contains _s... or _t...), try to derive the original
-                    # filename by stripping transformation suffixes and check if
-                    # that object exists. This keeps the signing logic server-side
-                    # (no client leaks) and avoids brittle client-side fallbacks.
-                    try:
-                        import re
-                        derived = re.sub(r'(_s[^_]*)|(_t[^_]*)', '', filename)
-                        if derived and derived != filename:
-                            # ensure extension
-                            if not derived.lower().endswith('.glb') and filename.lower().endswith('.glb'):
-                                # keep .glb extension if original had it
-                                if '.' not in derived:
-                                    derived = derived + '.glb'
-                            derived_blob = bucket.blob(derived)
-                            try:
-                                if derived_blob.exists():
-                                    logging.info(f"Falling back to original object for signing: gs://{bucket.name}/{derived}")
-                                    url = derived_blob.generate_signed_url(version='v4', expiration=3600, method='GET')
-                                    return url
-                            except Exception:
-                                logging.exception("Failed to check derived blob.exists() for %s", derived)
-                    except Exception:
-                        logging.exception("Error deriving original filename from %s", filename)
-                    # if fallback didn't find anything, return None
-                    return None
-            except Exception:
-                # If the existence check fails (permissions/network), fall back
-                # to attempting to generate the signed URL so we don't block
-                # legitimate requests; we'll log the exception.
-                logging.exception("Failed to check blob.exists() for %s", filename)
+        blob = bucket.blob(filename)
+        # Verify object exists before returning a signed URL. Generating a
+        # signed URL for a non-existent object will produce a 404 when used
+        # by clients and makes debugging harder. Check existence and return
+        # None if absent so the caller can handle it explicitly.
+        try:
+            if not blob.exists():
+                logging.info(f"Requested signed URL for non-existent object: gs://{bucket.name}/{filename}")
+                # Server-side fallback: if the filename looks like a transformed
+                # variant (contains _s... or _t...), try to derive the original
+                # filename by stripping transformation suffixes and check if
+                # that object exists. This keeps the signing logic server-side
+                # (no client leaks) and avoids brittle client-side fallbacks.
+                try:
+                    import re
+                    derived = re.sub(r'(_s[^_]*)|(_t[^_]*)', '', filename)
+                    if derived and derived != filename:
+                        # ensure extension
+                        if not derived.lower().endswith('.glb') and filename.lower().endswith('.glb'):
+                            # keep .glb extension if original had it
+                            if '.' not in derived:
+                                derived = derived + '.glb'
+                        derived_blob = bucket.blob(derived)
+                        try:
+                            if derived_blob.exists():
+                                logging.info(f"Falling back to original object for signing: gs://{bucket.name}/{derived}")
+                                url = derived_blob.generate_signed_url(version='v4', expiration=3600, method='GET')
+                                return url
+                        except Exception:
+                            logging.exception("Failed to check derived blob.exists() for %s", derived)
+                except Exception:
+                    logging.exception("Error deriving original filename from %s", filename)
+                # if fallback didn't find anything, return None
+                return None
+        except Exception:
+            # If the existence check fails (permissions/network), fall back
+            # to attempting to generate the signed URL so we don't block
+            # legitimate requests; we'll log the exception.
+            logging.exception("Failed to check blob.exists() for %s", filename)
 
-            url = blob.generate_signed_url(
-                version='v4',
-                expiration=3600,
-                method='GET'
-            )
-            return url
+        url = blob.generate_signed_url(
+            version='v4',
+            expiration=3600,
+            method='GET'
+        )
+        return url
     except Exception as e:
         logging.exception(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return None
