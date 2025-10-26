@@ -269,6 +269,51 @@ async def get_conteudo_signed_urls(payload: dict = Body(...)):
             else:
                 result[orig] = signed
         return { 'signed_urls': result }
+
+
+    @app.get('/api/default-totem-signed-url')
+    async def get_default_totem_signed_url():
+        """
+        Retorna o signed URL canônico do totem usado como fallback no cliente.
+        Isto evita que o cliente precise conhecer o filename internamente.
+        """
+        try:
+            # Nome estático do totem dentro do bucket de conteúdo
+            default_filename = 'public/ra/totem/HorizontalTotemSelfService_05.glb'
+            # First attempt: use existing helper which also performs existence checks
+            url = await asyncio.to_thread(gerar_signed_url_conteudo, None, default_filename)
+            if url:
+                return { 'signed_url': url, 'filename': default_filename }
+
+            # If helper returned None, gather diagnostic info to help debugging
+            try:
+                bucket = get_bucket('conteudo')
+                bucket_name = getattr(bucket, 'name', None)
+                blob = bucket.blob(default_filename)
+                try:
+                    exists = blob.exists()
+                except Exception as e:
+                    logging.exception('Error checking blob.exists() for %s: %s', default_filename, e)
+                    exists = None
+            except Exception as e:
+                logging.exception('Error obtaining bucket or blob for diagnostics: %s', e)
+                bucket_name = None
+                exists = None
+
+            logging.info(f"Default totem not found for signing: {default_filename}; bucket={bucket_name}; exists={exists}")
+            # Return diagnostic info in body to aid debugging (non-sensitive)
+            detail = {
+                'error': 'object not found',
+                'filename_checked': default_filename,
+                'bucket': bucket_name,
+                'exists': exists
+            }
+            raise HTTPException(status_code=404, detail=json.dumps(detail))
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.exception(f'Failed to generate default totem signed url: {e}')
+            raise HTTPException(status_code=500, detail='internal error')
     except Exception as e:
         logging.exception(f"Failed to generate batch signed urls: {e}")
         raise HTTPException(status_code=500, detail='Failed to generate signed urls')
