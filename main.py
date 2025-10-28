@@ -818,7 +818,9 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
                 base_height = float(payload.get('height', 0.0))
             except Exception:
                 base_height = 0.0
-            await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height)
+            # Generate GLB without flipping UVs by default — avoid mirrored textures
+            # If needed, callers can later expose options to flip U/V per-content.
+            await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height, False, False)
 
             # upload to GCS using the stable filename (set cache-control + metadata)
             # Guardar apenas um identificador/sumário da origem da imagem nos metadados
