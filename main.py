@@ -829,7 +829,39 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
             except Exception:
                 plane_h = 1.0
 
-            await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_y=base_height, plane_height=plane_h, flip_u=False, flip_v=False)
+            # Allow callers to override UV flips per-content (useful to correct
+            # orientation differences between viewers/camera preview). Accepts
+            # boolean values or strings 'true'/'false'. Defaults chosen to avoid
+            # horizontal mirroring while keeping the vertical orientation that
+            # works for most mobile viewers.
+            def _to_bool(v, default=False):
+                try:
+                    if v is None:
+                        return default
+                    if isinstance(v, bool):
+                        return v
+                    s = str(v).strip().lower()
+                    if s in ('1','true','yes','y','t'):
+                        return True
+                    if s in ('0','false','no','n','f'):
+                        return False
+                except Exception:
+                    pass
+                return default
+
+            flip_u = _to_bool(payload.get('flip_u') if isinstance(payload, dict) else None, False)
+            # vertical flip default: True (fix common upside-down appearance on some viewers)
+            flip_v = _to_bool(payload.get('flip_v') if isinstance(payload, dict) else None, True)
+
+            await asyncio.to_thread(
+                generate_plane_glb,
+                processed_image,
+                temp_glb,
+                base_y=base_height,
+                plane_height=plane_h,
+                flip_u=flip_u,
+                flip_v=flip_v,
+            )
 
             # upload to GCS using the stable filename (set cache-control + metadata)
             # Guardar apenas um identificador/sumário da origem da imagem nos metadados
