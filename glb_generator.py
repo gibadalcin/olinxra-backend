@@ -62,7 +62,6 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
     normal_bytes = _pack_floats(normals)
     uv_bytes = _pack_floats(uvs)
     idx_bytes = _pack_uint16(indices)
-    idx_bytes = _pack_uint16(indices)
 
     # Prepare a small backing plane (solid color) slightly behind the textured
     # plane to act as a visual background when the viewer looks from behind.
@@ -76,7 +75,8 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
     normals_back = [0.0, 0.0, -1.0] * 4
     # UVs for back plane not needed for a solid color; supply zeros
     uvs_back = [0.0, 0.0] * 4
-    indices_back = [4, 5, 6, 5, 7, 6]
+    # indices for back plane must index into the back plane's own vertex accessor (0..3)
+    indices_back = [0, 1, 2, 1, 3, 2]
 
     # Build binary blob: positions | normals | uvs | indices | positions_back | normals_back | uvs_back | indices_back | image
     pos_bytes = _pack_floats(positions)
