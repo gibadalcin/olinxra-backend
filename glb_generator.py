@@ -113,6 +113,34 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
         idx_back_bytes_padded = idx_back_bytes
     blob_parts.append(idx_back_bytes_padded); idx_back_offset = offset; offset += len(idx_back_bytes_padded)
 
+    # Debug geometry: small red triangle in front of the plane to verify rendering
+    dbg_offset_z = 0.02
+    positions_dbg = [
+        0.0, top_y + 0.05, dbg_offset_z,
+        0.05, top_y + 0.05, dbg_offset_z,
+       -0.05, top_y + 0.05, dbg_offset_z,
+    ]
+    normals_dbg = [0.0, 0.0, 1.0] * 3
+    uvs_dbg = [0.0, 0.0] * 3
+    indices_dbg = [0, 1, 2]
+
+    pos_dbg_bytes = _pack_floats(positions_dbg)
+    normal_dbg_bytes = _pack_floats(normals_dbg)
+    uv_dbg_bytes = _pack_floats(uvs_dbg)
+    idx_dbg_bytes = _pack_uint16(indices_dbg)
+
+    # pad debug indices to 4 bytes alignment
+    if len(idx_dbg_bytes) % 4 != 0:
+        padding_len_dbg = 4 - (len(idx_dbg_bytes) % 4)
+        idx_dbg_bytes_padded = idx_dbg_bytes + (b'\x00' * padding_len_dbg)
+    else:
+        idx_dbg_bytes_padded = idx_dbg_bytes
+
+    blob_parts.append(pos_dbg_bytes); pos_dbg_offset = offset; offset += len(pos_dbg_bytes)
+    blob_parts.append(normal_dbg_bytes); normal_dbg_offset = offset; offset += len(normal_dbg_bytes)
+    blob_parts.append(uv_dbg_bytes); uv_dbg_offset = offset; offset += len(uv_dbg_bytes)
+    blob_parts.append(idx_dbg_bytes_padded); idx_dbg_offset = offset; offset += len(idx_dbg_bytes_padded)
+
     # image align to 4 bytes as well
     if len(image_bytes) % 4 != 0:
         padding_len = 4 - (len(image_bytes) % 4)
@@ -149,9 +177,19 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
     gltf.bufferViews.append(BufferView(buffer=0, byteOffset=idx_back_offset, byteLength=len(idx_back_bytes_padded)))
     idx_back_bv = 7
 
+    # debug bufferViews
+    gltf.bufferViews.append(BufferView(buffer=0, byteOffset=pos_dbg_offset, byteLength=len(pos_dbg_bytes)))
+    pos_dbg_bv = 8
+    gltf.bufferViews.append(BufferView(buffer=0, byteOffset=normal_dbg_offset, byteLength=len(normal_dbg_bytes)))
+    normal_dbg_bv = 9
+    gltf.bufferViews.append(BufferView(buffer=0, byteOffset=uv_dbg_offset, byteLength=len(uv_dbg_bytes)))
+    uv_dbg_bv = 10
+    gltf.bufferViews.append(BufferView(buffer=0, byteOffset=idx_dbg_offset, byteLength=len(idx_dbg_bytes_padded)))
+    idx_dbg_bv = 11
+
     # image bufferView
     gltf.bufferViews.append(BufferView(buffer=0, byteOffset=image_offset, byteLength=len(image_bytes_padded)))
-    image_bv = 8
+    image_bv = 12
 
     # Accessors
     gltf.accessors = []
@@ -182,6 +220,17 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
     # back indices accessor
     gltf.accessors.append(Accessor(bufferView=idx_back_bv, byteOffset=0, componentType=5123, count=6, type="SCALAR"))
     idx_back_acc = 7
+
+    # debug accessors (triangle)
+    min_pos_dbg, max_pos_dbg = _min_max_positions(positions_dbg)
+    gltf.accessors.append(Accessor(bufferView=pos_dbg_bv, byteOffset=0, componentType=5126, count=3, type="VEC3", min=min_pos_dbg, max=max_pos_dbg))
+    pos_dbg_acc = 8
+    gltf.accessors.append(Accessor(bufferView=normal_dbg_bv, byteOffset=0, componentType=5126, count=3, type="VEC3"))
+    normal_dbg_acc = 9
+    gltf.accessors.append(Accessor(bufferView=uv_dbg_bv, byteOffset=0, componentType=5126, count=3, type="VEC2"))
+    uv_dbg_acc = 10
+    gltf.accessors.append(Accessor(bufferView=idx_dbg_bv, byteOffset=0, componentType=5123, count=3, type="SCALAR"))
+    idx_dbg_acc = 11
 
     # Image
     # Try to detect mime type
@@ -217,7 +266,15 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
     except Exception:
         setattr(mat_back, 'doubleSided', True)
 
-    gltf.materials = [mat, mat_back]
+    # Debug material: solid red for debug triangle
+    mat_dbg = Material(name="mat_dbg")
+    mat_dbg.pbrMetallicRoughness = {"baseColorFactor": [1.0, 0.2, 0.2, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.8}
+    try:
+        mat_dbg.doubleSided = True
+    except Exception:
+        setattr(mat_dbg, 'doubleSided', True)
+
+    gltf.materials = [mat, mat_back, mat_dbg]
 
     # Meshes + Primitives
     prim_front = Primitive(attributes={"POSITION": pos_acc, "NORMAL": normal_acc, "TEXCOORD_0": uv_acc}, indices=idx_acc, material=0)
@@ -226,13 +283,18 @@ def generate_plane_glb(image_path: str, output_glb_path: str, base_y: float = 0.
     prim_back = Primitive(attributes={"POSITION": pos_back_acc, "NORMAL": normal_back_acc}, indices=idx_back_acc, material=1)
     mesh_back = Mesh(primitives=[prim_back], name="plane_back")
 
-    gltf.meshes = [mesh_front, mesh_back]
+    # Debug primitive + mesh (small red triangle)
+    prim_dbg = Primitive(attributes={"POSITION": pos_dbg_acc, "NORMAL": normal_dbg_acc, "TEXCOORD_0": uv_dbg_acc}, indices=idx_dbg_acc, material=2)
+    mesh_dbg = Mesh(primitives=[prim_dbg], name="debug_triangle")
+
+    gltf.meshes = [mesh_front, mesh_back, mesh_dbg]
 
     # Nodes + Scene: include both meshes so they render together
     node_front = Node(mesh=0, name="node_front")
     node_back = Node(mesh=1, name="node_back")
-    gltf.nodes = [node_front, node_back]
-    scene = Scene(nodes=[0, 1])
+    node_dbg = Node(mesh=2, name="node_debug_triangle")
+    gltf.nodes = [node_front, node_back, node_dbg]
+    scene = Scene(nodes=[0, 1, 2])
     gltf.scenes = [scene]
     gltf.scene = 0
 

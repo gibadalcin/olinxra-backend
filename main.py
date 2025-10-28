@@ -818,9 +818,18 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
                 base_height = float(payload.get('height', 0.0))
             except Exception:
                 base_height = 0.0
-            # Generate GLB without flipping UVs by default — avoid mirrored textures
-            # If needed, callers can later expose options to flip U/V per-content.
-            await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_height, False, False)
+            # Generate GLB: ensure plane_height is numeric (default 1.0) and explicitly
+            # pass flip flags by name to avoid accidental positional swaps.
+            plane_h = 1.0
+            try:
+                # allow caller to suggest plane height via payload.plane_height (meters)
+                ph = payload.get('plane_height') if isinstance(payload, dict) else None
+                if ph is not None:
+                    plane_h = float(ph)
+            except Exception:
+                plane_h = 1.0
+
+            await asyncio.to_thread(generate_plane_glb, processed_image, temp_glb, base_y=base_height, plane_height=plane_h, flip_u=False, flip_v=False)
 
             # upload to GCS using the stable filename (set cache-control + metadata)
             # Guardar apenas um identificador/sumário da origem da imagem nos metadados
