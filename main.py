@@ -622,10 +622,43 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
             raise HTTPException(status_code=401, detail='Invalid or expired Firebase token')
 
     image_url = payload.get('image_url')
-    # Use hash-based filename for stable cache key (avoid re-generating for same image_url)
+    # Use hash-based filename for stable cache key (avoid re-generating for same content)
     if not image_url:
         raise HTTPException(status_code=400, detail='image_url required')
-    sha = hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:16]
+
+    # Normaliza a chave de cache para evitar duplicação quando a mesma imagem é referenciada
+    # por URLs diferentes (ex.: GCS signed URLs com querystring expirada) ou por data URLs
+    # equivalentes. Para data URLs: hash dos bytes decodificados. Para HTTPS: hash de
+    # scheme://host/path (sem query/fragment), com host em minúsculas.
+    from urllib.parse import urlsplit, urlunsplit
+    def _stable_sha_from_image(image_url_str: str) -> str:
+        try:
+            if isinstance(image_url_str, str) and image_url_str.startswith('data:'):
+                import base64, re
+                m = re.match(r'data:(image/[^;]+);base64,(.+)', image_url_str, re.I)
+                if not m:
+                    # Se for um data URL inesperado, usa o string bruto
+                    return hashlib.sha256(image_url_str.encode('utf-8')).hexdigest()[:16]
+                b64 = m.group(2)
+                try:
+                    raw = base64.b64decode(b64, validate=False)
+                except Exception:
+                    raw = base64.b64decode(b64)
+                return hashlib.sha256(raw).hexdigest()[:16]
+            else:
+                p = urlsplit(image_url_str)
+                # normaliza host para minúsculas e remove query/fragment
+                netloc = (p.hostname or '').lower()
+                # preserva porta explícita se houver
+                if p.port:
+                    netloc = f"{netloc}:{p.port}"
+                normalized = urlunsplit((p.scheme, netloc, p.path or '/', '', ''))
+                return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:16]
+        except Exception:
+            # fallback seguro
+            return hashlib.sha256(str(image_url_str).encode('utf-8')).hexdigest()[:16]
+
+    sha = _stable_sha_from_image(image_url)
     base_filename = f'generated_{sha}.glb'
 
     # Determine owner prefix (if provided) and compose final filename inside the 'conteudo' bucket
