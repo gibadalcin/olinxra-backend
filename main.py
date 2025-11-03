@@ -692,7 +692,7 @@ async def add_logo(
         features = np.array(features, dtype=np.float32)
         features /= np.linalg.norm(features)
         # Upload ao GCS pode envolver I/O síncrono; executa em threadpool também
-        gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, os.path.basename(file.filename))
+        gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, os.path.basename(file.filename), "logos")
         doc = {
             "nome": name,
             "url": gcs_url,
