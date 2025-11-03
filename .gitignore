@@ -13,6 +13,13 @@ __pycache__/
 # Modelos grandes
 *.onnx
 
+#tools
+tools/check_sizes.py
+tools/dump_glb_structure.py
+tools/extract_image_from_glb.py
+tools/inspect_downloaded.py
+tools/test_generate_inspect.py
+
 # Credenciais
 cloud-storage-cred.json
 models-downloader-cred.json

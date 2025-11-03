@@ -146,12 +146,17 @@ def sanitize_for_json(obj):
 # --- Helpers de Inicialização ---
 ###############################################################
 # Função utilitária e endpoint para gerar signed URL de conteúdo
-def gerar_signed_url_conteudo(gs_url=None, filename=None):
+def gerar_signed_url_conteudo(gs_url=None, filename=None, expiration=3600):
     """
     Gera um signed URL para um objeto no bucket de conteúdo ou logos.
     Aceita dois modos de chamada:
     - gs_url (ex: 'gs://bucket/path/file.glb') OR
     - filename (ex: 'public/ra/totem/file.glb') — neste caso assumimos bucket de conteúdo.
+    
+    Args:
+        gs_url: URL completa no formato gs://bucket/path
+        filename: Nome do arquivo no bucket
+        expiration: Tempo de expiração em segundos (padrão: 3600 = 1h)
     """
     try:
         # Determine bucket names from gcs_utils (loaded from env)
@@ -229,13 +234,133 @@ def gerar_signed_url_conteudo(gs_url=None, filename=None):
 
         url = blob.generate_signed_url(
             version='v4',
-            expiration=3600,
+            expiration=expiration,
             method='GET'
         )
         return url
     except Exception as e:
         logging.exception(f"Erro ao gerar signed URL para {filename} (bucket {tipo_bucket}): {e}")
         return None
+
+def get_glb_path_from_image_url(image_url):
+    """
+    Deriva o path do GLB a partir de uma URL de imagem.
+    
+    Exemplo:
+        gs://bucket/TR77xSOJ.../totem_header.jpg 
+        → gs://bucket/TR77xSOJ.../ra/models/totem_header.glb
+    
+    Args:
+        image_url: URL da imagem (gs://bucket/path/image.jpg)
+    
+    Returns:
+        URL do GLB correspondente ou None se não conseguir derivar
+    """
+    try:
+        if not image_url or not isinstance(image_url, str):
+            return None
+        
+        if not image_url.startswith('gs://'):
+            return None
+        
+        # Parse: gs://bucket/owner_uid/image.jpg
+        # Result: gs://bucket/owner_uid/ra/models/image.glb
+        
+        # Remove gs://bucket/
+        parts = image_url.split('/', 3)
+        if len(parts) < 4:
+            return None
+        
+        bucket = parts[2]  # nome do bucket
+        path = parts[3]    # owner_uid/image.jpg
+        
+        # Extrair owner_uid e filename
+        path_parts = path.split('/', 1)
+        if len(path_parts) < 2:
+            # Imagem não está em owner_uid/image.jpg (pode ser public/...)
+            # Tentar extrair apenas o nome do arquivo
+            filename = path.split('/')[-1]
+            owner_uid = None
+        else:
+            owner_uid = path_parts[0]
+            filename = path_parts[1].split('/')[-1]  # pega última parte do path
+        
+        # Remover extensão e adicionar .glb
+        name_without_ext = filename.rsplit('.', 1)[0]
+        glb_filename = f"{name_without_ext}.glb"
+        
+        # Construir path do GLB
+        if owner_uid:
+            glb_path = f"{owner_uid}/ra/models/{glb_filename}"
+        else:
+            # Fallback: public/ra/models/
+            glb_path = f"public/ra/models/{glb_filename}"
+        
+        glb_url = f"gs://{bucket}/{glb_path}"
+        return glb_url
+    except Exception as e:
+        logging.exception(f"Erro ao derivar GLB path de {image_url}: {e}")
+        return None
+
+async def delete_image_and_glb(item, db):
+    """
+    Deleta uma imagem e seu GLB associado do GCS.
+    
+    Args:
+        item: Dict com 'gs_url' ou 'filename' da imagem
+        db: Database connection para pending_deletes
+    
+    Returns:
+        True se deletou com sucesso, False caso contrário
+    """
+    from gcs_utils import delete_gs_path, delete_file
+    
+    deleted_image = False
+    deleted_glb = False
+    
+    try:
+        # 1. Deletar imagem original
+        image_url = item.get('gs_url')
+        image_filename = item.get('filename')
+        
+        if image_url:
+            # Derivar GLB URL antes de deletar a imagem
+            glb_url = get_glb_path_from_image_url(image_url)
+            
+            # Deletar imagem
+            deleted_image = await asyncio.to_thread(delete_gs_path, image_url)
+            logging.info(f"[delete_image_and_glb] Imagem deletada: {image_url} (sucesso: {deleted_image})")
+            
+            # 2. Deletar GLB associado (se existir)
+            if glb_url:
+                try:
+                    deleted_glb = await asyncio.to_thread(delete_gs_path, glb_url)
+                    logging.info(f"[delete_image_and_glb] GLB deletado: {glb_url} (sucesso: {deleted_glb})")
+                except Exception as e:
+                    logging.warning(f"[delete_image_and_glb] Erro ao deletar GLB {glb_url}: {e}")
+        
+        elif image_filename:
+            # Construir gs_url a partir do filename
+            image_url = f"gs://{GCS_BUCKET_CONTEUDO}/{image_filename}"
+            glb_url = get_glb_path_from_image_url(image_url)
+            
+            # Deletar imagem
+            deleted_image = await asyncio.to_thread(delete_file, image_filename, item.get('tipo', 'conteudo'))
+            logging.info(f"[delete_image_and_glb] Imagem deletada: {image_filename} (sucesso: {deleted_image})")
+            
+            # 2. Deletar GLB associado (se existir)
+            if glb_url:
+                try:
+                    deleted_glb = await asyncio.to_thread(delete_gs_path, glb_url)
+                    logging.info(f"[delete_image_and_glb] GLB deletado: {glb_url} (sucesso: {deleted_glb})")
+                except Exception as e:
+                    logging.warning(f"[delete_image_and_glb] Erro ao deletar GLB {glb_url}: {e}")
+        
+        return deleted_image  # Retorna sucesso se pelo menos a imagem foi deletada
+    
+    except Exception as e:
+        logging.exception(f"[delete_image_and_glb] Erro ao deletar imagem e GLB: {e}")
+        return False
 
 @app.get("/api/conteudo-signed-url")
 async def get_conteudo_signed_url(gs_url: str = Query(None), filename: str = Query(None)):
@@ -345,6 +470,11 @@ async def verify_firebase_token_dep(credentials: HTTPAuthorizationCredentials = 
 async def attach_signed_urls_to_blocos(blocos):
     """Given a list of blocos, attach a 'signed_url' field for media blocos.
     This runs gerar_signed_url_conteudo in a thread to avoid blocking the event loop.
+    
+    IMPORTANTE: Esta função é usada pelos endpoints PÚBLICOS (/api/conteudo, /api/conteudo-por-regiao)
+    que o app mobile usa SEM autenticação. Por isso, gera signed URLs para:
+    - Imagens originais (signed_url)
+    - GLBs pré-gerados (glb_signed_url)
     """
     if not blocos or not isinstance(blocos, list):
         return blocos
@@ -374,6 +504,23 @@ async def attach_signed_urls_to_blocos(blocos):
                             signed = await asyncio.to_thread(gerar_signed_url_conteudo, url, filename)
                             if signed:
                                 it['signed_url'] = signed
+                        
+                        # 🆕 FASE 1: Gerar signed URL para GLB (se existir)
+                        glb_url = it.get('glb_url')
+                        glb_filename = it.get('glb_filename')
+                        if glb_url:
+                            try:
+                                # GLBs devem ter expiração longa (365 dias) para app mobile
+                                glb_signed = await asyncio.to_thread(
+                                    gerar_signed_url_conteudo, 
+                                    glb_url, 
+                                    glb_filename,
+                                    365*24*60*60  # 1 ano
+                                )
+                                if glb_signed:
+                                    it['glb_signed_url'] = glb_signed
+                            except Exception:
+                                pass  # Não quebra se GLB falhar
                     except Exception:
                         continue
                 continue
@@ -390,6 +537,23 @@ async def attach_signed_urls_to_blocos(blocos):
                 except Exception:
                     # ignore signing failures, frontend can fallback
                     pass
+            
+            # 🆕 FASE 1: Gerar signed URL para GLB do bloco (se existir)
+            glb_url = b.get('glb_url')
+            glb_filename = b.get('glb_filename')
+            if glb_url:
+                try:
+                    # GLBs devem ter expiração longa (365 dias) para app mobile
+                    glb_signed = await asyncio.to_thread(
+                        gerar_signed_url_conteudo,
+                        glb_url,
+                        glb_filename,
+                        365*24*60*60  # 1 ano
+                    )
+                    if glb_signed:
+                        b['glb_signed_url'] = glb_signed
+                except Exception:
+                    pass  # Não quebra se GLB falhar
         except Exception:
             continue
     return blocos
@@ -674,23 +838,23 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
     except Exception:
         provided_filename = None
 
-    # If a filename was provided by the caller, respect it. If it is a simple name (no prefix),
-    # and owner_uid is present, place it under {owner_uid}/ra/models/. Otherwise, if no filename
-    # provided, create a generated name under the owner-specific prefix or under public/ra/models.
+    # Arquitetura de pastas no GCS:
+    # - Imagens originais: {owner_uid}/image.jpg
+    # - GLBs gerados:      {owner_uid}/ra/models/image.glb
+    # IMPORTANTE: GLBs devem SEMPRE ficar isolados por usuário para segurança e gerenciamento.
+    # Se não houver owner_uid, usar 'anonymous' como fallback (para compatibilidade com requests sem auth).
+    if not owner_uid:
+        logging.warning(f"[generate-glb] owner_uid não fornecido, usando 'anonymous' como fallback")
+        owner_uid = 'anonymous'
+    
     if provided_filename and isinstance(provided_filename, str) and provided_filename.strip() != "":
         # avoid double-prefixing: if provided_filename already looks like a path, use as-is
         if '/' in provided_filename:
             filename = provided_filename
         else:
-            if owner_uid:
-                filename = f"{owner_uid}/ra/models/{provided_filename}"
-            else:
-                filename = f"public/ra/models/{provided_filename}"
+            filename = f"{owner_uid}/ra/models/{provided_filename}"
     else:
-        if owner_uid:
-            filename = f"{owner_uid}/ra/models/{base_filename}"
-        else:
-            filename = f"public/ra/models/{base_filename}"
+        filename = f"{owner_uid}/ra/models/{base_filename}"
 
     temp_image = None
     temp_glb = None
@@ -1747,7 +1911,6 @@ async def post_conteudo(
 
             # enqueue deletions and attempt immediate delete; then remove document
             try:
-                from gcs_utils import delete_gs_path, delete_file
                 for item in to_delete:
                     try:
                         # insert pending_deletes entry
@@ -1761,17 +1924,10 @@ async def post_conteudo(
                             'last_attempt': None
                         }
                         res = await db['pending_deletes'].insert_one(pend)
-                        # attempt immediate deletion in thread
-                        def try_del():
-                            try:
-                                if item.get('gs_url'):
-                                    return delete_gs_path(item.get('gs_url'))
-                                elif item.get('filename'):
-                                    return delete_file(item.get('filename'), item.get('tipo', 'conteudo'))
-                            except Exception:
-                                return False
-                            return False
-                        ok = await asyncio.to_thread(try_del)
+                        
+                        # 🆕 Deletar imagem E GLB associado
+                        ok = await delete_image_and_glb(item, db)
+                        
                         if ok:
                             await db['pending_deletes'].update_one({'_id': res.inserted_id}, {'$set': {'status': 'done', 'last_attempt': datetime.utcnow()}})
                     except Exception:
@@ -1852,7 +2008,6 @@ async def post_conteudo(
                     if dry_run:
                         return {'action': 'dry_run', 'to_delete': to_delete, 'blocos': cleaned_blocos}
 
-                    from gcs_utils import delete_gs_path, delete_file
                     for item in to_delete:
                         try:
                             pend = {
@@ -1865,16 +2020,10 @@ async def post_conteudo(
                                 'last_attempt': None
                             }
                             res = await db['pending_deletes'].insert_one(pend)
-                            def try_del():
-                                try:
-                                    if item.get('gs_url'):
-                                        return delete_gs_path(item.get('gs_url'))
-                                    elif item.get('filename'):
-                                        return delete_file(item.get('filename'), item.get('tipo', 'conteudo'))
-                                except Exception:
-                                    return False
-                                return False
-                            ok = await asyncio.to_thread(try_del)
+                            
+                            # 🆕 Deletar imagem E GLB associado
+                            ok = await delete_image_and_glb(item, db)
+                            
                             if ok:
                                 await db['pending_deletes'].update_one({'_id': res.inserted_id}, {'$set': {'status': 'done', 'last_attempt': datetime.utcnow()}})
                         except Exception:
@@ -1932,14 +2081,16 @@ async def admin_process_pending_deletes(token: dict = Depends(verify_firebase_to
     # process pending deletes (simple synchronous attempt)
     pending = await db['pending_deletes'].find({'status': {'$in': ['pending', 'retry']}}).to_list(length=1000)
     processed = []
-    from gcs_utils import delete_gs_path, delete_file
     for p in pending:
         try:
-            ok = False
-            if p.get('gs_url'):
-                ok = await asyncio.to_thread(delete_gs_path, p.get('gs_url'))
-            elif p.get('filename'):
-                ok = await asyncio.to_thread(delete_file, p.get('filename'), p.get('tipo', 'conteudo'))
+            # 🆕 Deletar imagem E GLB associado
+            item = {
+                'gs_url': p.get('gs_url'),
+                'filename': p.get('filename'),
+                'tipo': p.get('tipo', 'conteudo')
+            }
+            ok = await delete_image_and_glb(item, db)
+            
             if ok:
                 await db['pending_deletes'].update_one({'_id': p['_id']}, {'$set': {'status': 'done', 'last_attempt': datetime.utcnow()}})
                 processed.append({'id': str(p['_id']), 'status': 'done'})
@@ -2018,6 +2169,90 @@ async def add_content_image(
             signed = gerar_signed_url_conteudo(gcs_url, gcs_filename)
         except Exception:
             signed = gcs_url
+        
+        # 🆕 FASE 1 - Pré-geração automática de GLB para imagens
+        glb_url = None
+        glb_signed_url = None
+        if file.content_type and file.content_type.startswith('image/'):
+            try:
+                t_glb_start = time.time()
+                logging.info(f"[add_content_image] Iniciando pré-geração de GLB para {gcs_filename}")
+                
+                # Gerar GLB a partir da imagem recém-uploadada
+                glb_filename = f"{token['uid']}/ra/models/{name_base}.glb"
+                glb_temp = None
+                
+                # Resize se necessário (mesma lógica do endpoint generate-glb)
+                MAX_IMAGE_DIM = int(os.getenv('GLB_MAX_DIM', '2048'))
+                def _resize_if_needed(src_path, max_dim):
+                    img = PILImage.open(src_path)
+                    w, h = img.size
+                    if max(w, h) > max_dim:
+                        ratio = max_dim / float(max(w, h))
+                        new_size = (int(w * ratio), int(h * ratio))
+                        img = img.convert('RGB')
+                        img = img.resize(new_size, PILImage.LANCZOS)
+                        dst = src_path + '.resized.jpg'
+                        img.save(dst, format='JPEG', quality=90)
+                        return dst
+                    return src_path
+                
+                processed_image = await asyncio.to_thread(_resize_if_needed, temp_path, MAX_IMAGE_DIM)
+                
+                # Gerar GLB
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
+                    glb_temp = tg.name
+                
+                await asyncio.to_thread(
+                    generate_plane_glb,
+                    processed_image,
+                    glb_temp,
+                    base_y=0.0,
+                    plane_height=1.0,
+                    flip_u=False,
+                    flip_v=True
+                )
+                
+                # Upload GLB para GCS
+                metadata = {
+                    'generated_from_image': gcs_url,
+                    'base_height': '0.0',
+                    'auto_generated': 'true'
+                }
+                glb_gcs_url = await asyncio.to_thread(
+                    upload_image_to_gcs,
+                    glb_temp,
+                    glb_filename,
+                    'conteudo',
+                    'public, max-age=31536000',
+                    metadata
+                )
+                
+                # Gerar signed URL para o GLB (expiração: 365 dias = 1 ano)
+                # IMPORTANTE: Signed URLs longas evitam que app mobile precise regenerar constantemente
+                # GLBs são arquivos estáticos que raramente mudam, então 1 ano é aceitável
+                try:
+                    glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=365*24*60*60)
+                    glb_url = glb_gcs_url
+                    t_glb_end = time.time()
+                    logging.info(f"[add_content_image] GLB gerado com sucesso em {t_glb_end - t_glb_start:.2f}s: {glb_filename}")
+                except Exception as e:
+                    logging.warning(f"[add_content_image] Erro ao gerar signed URL do GLB: {e}")
+                    glb_url = glb_gcs_url
+                
+                # Limpar arquivo temporário do GLB
+                if glb_temp and os.path.exists(glb_temp):
+                    os.remove(glb_temp)
+                    
+            except Exception as e:
+                logging.exception(f"[add_content_image] Erro ao gerar GLB (não-fatal): {e}")
+                # Não falha o upload se a geração do GLB falhar
+        
+        # Adicionar URLs do GLB ao bloco se foram gerados
+        if glb_url:
+            bloco_img["glb_url"] = glb_url
+            bloco_img["glb_signed_url"] = glb_signed_url
+        
         t3 = time.time()
         logging.info(f"[add_content_image] Upload concluído (não persiste no DB). Tempo total: {t3-t0:.2f}s")
         resp = {"success": True, "url": gcs_url, "signed_url": signed, "bloco": bloco_img}
@@ -2025,7 +2260,7 @@ async def add_content_image(
             resp["temp_id"] = temp_id
         # Log minimal info: uid and filename/type
         try:
-            logging.info(f"[add_content_image] upload ok uid={token.get('uid')} filename={gcs_filename} type={file.content_type}")
+            logging.info(f"[add_content_image] upload ok uid={token.get('uid')} filename={gcs_filename} type={file.content_type} glb={'SIM' if glb_url else 'NÃO'}")
         except Exception:
             pass
         return resp
