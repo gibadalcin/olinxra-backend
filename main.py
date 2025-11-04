@@ -155,7 +155,7 @@ def sanitize_for_json(obj):
 # --- Helpers de Inicialização ---
 ###############################################################
 # Função utilitária e endpoint para gerar signed URL de conteúdo
-def gerar_signed_url_conteudo(gs_url=None, filename=None, expiration=3600):
+def gerar_signed_url_conteudo(gs_url=None, filename=None, expiration=3600, skip_exists_check=False):
     """
     Gera um signed URL para um objeto no bucket de conteúdo ou logos.
     Aceita dois modos de chamada:
@@ -166,6 +166,7 @@ def gerar_signed_url_conteudo(gs_url=None, filename=None, expiration=3600):
         gs_url: URL completa no formato gs://bucket/path
         filename: Nome do arquivo no bucket
         expiration: Tempo de expiração em segundos (padrão: 3600 = 1h)
+        skip_exists_check: Se True, pula verificação de existência (otimização para smart-content)
     """
     try:
         # Determine bucket names from gcs_utils (loaded from env)
@@ -202,44 +203,48 @@ def gerar_signed_url_conteudo(gs_url=None, filename=None, expiration=3600):
 
         bucket = get_bucket('conteudo' if tipo_bucket == 'conteudo' else 'logos')
         blob = bucket.blob(filename)
-        # Verify object exists before returning a signed URL. Generating a
-        # signed URL for a non-existent object will produce a 404 when used
-        # by clients and makes debugging harder. Check existence and return
-        # None if absent so the caller can handle it explicitly.
-        try:
-            if not blob.exists():
-                logging.info(f"Requested signed URL for non-existent object: gs://{bucket.name}/{filename}")
-                # Server-side fallback: if the filename looks like a transformed
-                # variant (contains _s... or _t...), try to derive the original
-                # filename by stripping transformation suffixes and check if
-                # that object exists. This keeps the signing logic server-side
-                # (no client leaks) and avoids brittle client-side fallbacks.
-                try:
-                    import re
-                    derived = re.sub(r'(_s[^_]*)|(_t[^_]*)', '', filename)
-                    if derived and derived != filename:
-                        # ensure extension
-                        if not derived.lower().endswith('.glb') and filename.lower().endswith('.glb'):
-                            # keep .glb extension if original had it
-                            if '.' not in derived:
-                                derived = derived + '.glb'
-                        derived_blob = bucket.blob(derived)
-                        try:
-                            if derived_blob.exists():
-                                logging.info(f"Falling back to original object for signing: gs://{bucket.name}/{derived}")
-                                url = derived_blob.generate_signed_url(version='v4', expiration=3600, method='GET')
-                                return url
-                        except Exception:
-                            logging.exception("Failed to check derived blob.exists() for %s", derived)
-                except Exception:
-                    logging.exception("Error deriving original filename from %s", filename)
-                # if fallback didn't find anything, return None
-                return None
-        except Exception:
-            # If the existence check fails (permissions/network), fall back
-            # to attempting to generate the signed URL so we don't block
-            # legitimate requests; we'll log the exception.
-            logging.exception("Failed to check blob.exists() for %s", filename)
+        
+        # ⚡ OTIMIZAÇÃO: Pular verificação de existência quando skip_exists_check=True
+        # Isso economiza ~100-200ms por arquivo em smart-content
+        if not skip_exists_check:
+            # Verify object exists before returning a signed URL. Generating a
+            # signed URL for a non-existent object will produce a 404 when used
+            # by clients and makes debugging harder. Check existence and return
+            # None if absent so the caller can handle it explicitly.
+            try:
+                if not blob.exists():
+                    logging.info(f"Requested signed URL for non-existent object: gs://{bucket.name}/{filename}")
+                    # Server-side fallback: if the filename looks like a transformed
+                    # variant (contains _s... or _t...), try to derive the original
+                    # filename by stripping transformation suffixes and check if
+                    # that object exists. This keeps the signing logic server-side
+                    # (no client leaks) and avoids brittle client-side fallbacks.
+                    try:
+                        import re
+                        derived = re.sub(r'(_s[^_]*)|(_t[^_]*)', '', filename)
+                        if derived and derived != filename:
+                            # ensure extension
+                            if not derived.lower().endswith('.glb') and filename.lower().endswith('.glb'):
+                                # keep .glb extension if original had it
+                                if '.' not in derived:
+                                    derived = derived + '.glb'
+                            derived_blob = bucket.blob(derived)
+                            try:
+                                if derived_blob.exists():
+                                    logging.info(f"Falling back to original object for signing: gs://{bucket.name}/{derived}")
+                                    url = derived_blob.generate_signed_url(version='v4', expiration=3600, method='GET')
+                                    return url
+                            except Exception:
+                                logging.exception("Failed to check derived blob.exists() for %s", derived)
+                    except Exception:
+                        logging.exception("Error deriving original filename from %s", filename)
+                    # if fallback didn't find anything, return None
+                    return None
+            except Exception:
+                # If the existence check fails (permissions/network), fall back
+                # to attempting to generate the signed URL so we don't block
+                # legitimate requests; we'll log the exception.
+                logging.exception("Failed to check blob.exists() for %s", filename)
 
         url = blob.generate_signed_url(
             version='v4',
@@ -561,6 +566,103 @@ async def attach_signed_urls_to_blocos(blocos):
                 continue
     
     return blocos
+
+
+async def attach_signed_urls_to_blocos_fast(blocos):
+    """
+    Versão OTIMIZADA de attach_signed_urls_to_blocos para smart-content.
+    
+    Diferenças:
+    - skip_exists_check=True (pula verificação blob.exists(), economiza ~100-200ms por arquivo)
+    - TTL de 7 dias para TODAS as URLs (permite cache mais longo)
+    - Assume que os blocos já foram validados no banco
+    
+    ⚡ GANHO ESPERADO: -2 a -3s no total
+    """
+    if not blocos or not isinstance(blocos, list):
+        return blocos
+    
+    tasks = []
+    task_metadata = []
+    
+    for b in blocos:
+        try:
+            tipo_selecionado = b.get('tipoSelecionado') or ''
+            tipo_label = b.get('tipo') or ''
+            is_media = False
+            if isinstance(tipo_selecionado, str) and tipo_selecionado.lower() in ('imagem', 'carousel', 'video'):
+                is_media = True
+            else:
+                tl = tipo_label.lower() if isinstance(tipo_label, str) else ''
+                if tl.startswith('imagem') or tl.startswith('video') or tl.startswith('carousel'):
+                    is_media = True
+            if not is_media:
+                continue
+            
+            # Carousel items
+            if b.get('items') and isinstance(b.get('items'), list):
+                for it in b['items']:
+                    # URL da imagem (TTL 7 dias)
+                    url = it.get('url') or (it.get('meta') and it['meta'].get('url'))
+                    filename = it.get('filename') or (it.get('meta') and it['meta'].get('filename'))
+                    if not url and filename:
+                        url = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
+                    if url:
+                        tasks.append(asyncio.to_thread(
+                            gerar_signed_url_conteudo, url, filename, 
+                            expiration=7*24*60*60, skip_exists_check=True
+                        ))
+                        task_metadata.append((it, 'signed_url', 'image'))
+                    
+                    # URL do GLB (TTL 7 dias)
+                    glb_url = it.get('glb_url')
+                    glb_filename = it.get('glb_filename')
+                    if glb_url:
+                        tasks.append(asyncio.to_thread(
+                            gerar_signed_url_conteudo, glb_url, glb_filename, 
+                            expiration=7*24*60*60, skip_exists_check=True
+                        ))
+                        task_metadata.append((it, 'glb_signed_url', 'glb'))
+                continue
+            
+            # Single media block - imagem (TTL 7 dias)
+            url = b.get('url')
+            filename = b.get('filename')
+            if not url and filename:
+                url = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
+            if url:
+                tasks.append(asyncio.to_thread(
+                    gerar_signed_url_conteudo, url, filename,
+                    expiration=7*24*60*60, skip_exists_check=True
+                ))
+                task_metadata.append((b, 'signed_url', 'image'))
+            
+            # Single media block - GLB (TTL 7 dias)
+            glb_url = b.get('glb_url')
+            glb_filename = b.get('glb_filename')
+            if glb_url:
+                tasks.append(asyncio.to_thread(
+                    gerar_signed_url_conteudo, glb_url, glb_filename,
+                    expiration=7*24*60*60, skip_exists_check=True
+                ))
+                task_metadata.append((b, 'glb_signed_url', 'glb'))
+        except Exception:
+            continue
+    
+    # Executar em paralelo
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for (target, field, tipo), result in zip(task_metadata, results):
+            try:
+                if isinstance(result, Exception):
+                    continue
+                if result:
+                    target[field] = result
+            except Exception:
+                continue
+    
+    return blocos
+
 
 # Configura CORS permitindo configurar as origens via variável de ambiente
 # Lê CORS_ALLOW_ORIGINS (comma-separated). Se ausente, usa fallback somente em dev.
@@ -1587,8 +1689,8 @@ async def smart_content_lookup(
     logging.info(f"[smart-content] ✅ Usando resultado: strategy={strategy}, detail={detail}")
     blocos_doc = conteudo.get('blocos', [])
     
-    # Gerar signed URLs em paralelo
-    await attach_signed_urls_to_blocos(blocos_doc)
+    # ⚡ Gerar signed URLs com versão OTIMIZADA (skip_exists_check + TTL 7 dias)
+    await attach_signed_urls_to_blocos_fast(blocos_doc)
     
     # 7. Montar resposta
     resultado = {
