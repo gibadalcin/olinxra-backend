@@ -18,9 +18,12 @@ class LogoIndex:
         D, I = self.index.search(np.expand_dims(query_vector, axis=0), top_k)
 
         results = []
-        # Threshold mais restritivo para evitar falsos positivos
+        # Threshold otimizado baseado em testes reais
         # Distância L2: 0.0 = perfeito, 0.3 = muito bom, 0.5 = aceitável
-        threshold = 0.35  # Reduzido de 0.8 para 0.35 para maior precisão
+        # threshold 0.38 = ~72.5% confidence (balanço entre precisão e recall)
+        # threshold 0.35 = ~74% confidence (muito restritivo, rejeita capturas válidas)
+        # threshold 0.43 = ~70% confidence (pode gerar alguns falsos positivos)
+        threshold = 0.38  # Otimizado para ~72.5% confidence mínimo
         for i in range(len(I[0])):
             logo_index = I[0][i]
             distance = D[0][i]
