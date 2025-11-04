@@ -2216,9 +2216,9 @@ async def add_content_image(
                 if glb_temp_path and os.path.exists(glb_temp_path):
                     os.remove(glb_temp_path)
                 
-                # Gerar signed URL
+                # Gerar signed URL (máximo 7 dias conforme limitação do GCS)
                 try:
-                    glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=365*24*60*60)
+                    glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=7*24*60*60)
                     glb_url = glb_gcs_url
                     glb_source = 'custom'
                     logging.info(f"[add_content_image] GLB customizado salvo: {glb_filename}")
@@ -2290,11 +2290,11 @@ async def add_content_image(
                     metadata
                 )
                 
-                # Gerar signed URL para o GLB (expiração: 365 dias = 1 ano)
-                # IMPORTANTE: Signed URLs longas evitam que app mobile precise regenerar constantemente
-                # GLBs são arquivos estáticos que raramente mudam, então 1 ano é aceitável
+                # Gerar signed URL para o GLB (máximo 7 dias conforme limitação do GCS)
+                # IMPORTANTE: Signed URLs expiram em 7 dias (limite do GCS)
+                # App mobile regenerará automaticamente via attach_signed_urls_to_blocos()
                 try:
-                    glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=365*24*60*60)
+                    glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=7*24*60*60)
                     glb_url = glb_gcs_url
                     glb_source = 'auto_generated'  # Marca origem
                     t_glb_end = time.time()
