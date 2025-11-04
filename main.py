@@ -41,6 +41,8 @@ http_bearer = HTTPBearer()
 client = None
 db = None
 logos_collection = None
+# Cache de geocoding em memória (otimização para evitar chamadas repetidas ao Nominatim)
+geocode_cache = {}
 # REMOVIDO: images_collection = None
 
 @asynccontextmanager
@@ -71,6 +73,13 @@ async def lifespan(app: FastAPI):
             ('tipo_regiao', 1),
             ('nome_regiao', 1)
         ], name='idx_nomemarca_owner_region', sparse=True)
+        
+        # NOVO: Índice otimizado para smart-content (nome_marca + tipo_regiao + nome_regiao)
+        await db['conteudos'].create_index([
+            ('nome_marca', 1),
+            ('tipo_regiao', 1),
+            ('nome_regiao', 1)
+        ], name='idx_smart_content_lookup')
 
         # Índice 2dsphere para consultas geoespaciais, se usarmos campo 'location'
         await db['conteudos'].create_index([('location', '2dsphere')], name='idx_location_2dsphere')
@@ -1448,31 +1457,52 @@ async def smart_content_lookup(
     
     logging.info(f"[smart-content] Buscando conteudo para marca={nome_marca}, lat={latitude}, lon={longitude}")
     
-    # 1. Buscar marca
-    marca = await logos_collection.find_one({"nome": nome_marca})
+    # 1. Buscar marca E fazer geocode EM PARALELO (otimização: -0.5s)
+    async def fetch_marca():
+        marca = await logos_collection.find_one({"nome": nome_marca})
+        if not marca:
+            logging.warning(f"[smart-content] Marca {nome_marca} nao encontrada")
+        return marca
+    
+    async def fetch_geocode():
+        # Cache de geocoding: arredondar coordenadas para 3 casas decimais (~111m de precisão)
+        cache_key = f"{round(latitude, 3)},{round(longitude, 3)}"
+        
+        # Verificar cache primeiro
+        if cache_key in geocode_cache:
+            logging.info(f"[smart-content] ⚡ Geocode CACHE HIT: {cache_key}")
+            return geocode_cache[cache_key]
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                rev_resp = await client.get(
+                    f"https://nominatim.openstreetmap.org/reverse",
+                    params={"lat": latitude, "lon": longitude, "format": "json"},
+                    headers={"User-Agent": "OlinxRA/1.0 (contact@olinxra.com)"}
+                )
+                if rev_resp.status_code == 200:
+                    data = rev_resp.json().get("address", {})
+                    logging.info(f"[smart-content] Geocode API: {data.get('city', 'N/A')}, {data.get('state', 'N/A')}")
+                    
+                    # Salvar no cache (máximo 1000 entradas para evitar vazamento de memória)
+                    if len(geocode_cache) < 1000:
+                        geocode_cache[cache_key] = data
+                    
+                    return data
+                else:
+                    logging.warning(f"[smart-content] Geocode falhou: HTTP {rev_resp.status_code}")
+        except Exception as e:
+            logging.error(f"[smart-content] Erro no geocode: {e}")
+        return None
+    
+    # Executar marca + geocode em paralelo
+    marca, geocode_data = await asyncio.gather(fetch_marca(), fetch_geocode())
+    
     if not marca:
-        logging.warning(f"[smart-content] Marca {nome_marca} nao encontrada")
         return {"conteudo": None, "mensagem": "Marca não encontrada."}
     
     marca_id = marca["_id"]
     logging.info(f"[smart-content] Marca encontrada: {marca_id}")
-    
-    # 2. Fazer reverse geocode UMA VEZ (reutilizado por todas as tasks)
-    geocode_data = None
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            rev_resp = await client.get(
-                f"https://nominatim.openstreetmap.org/reverse",
-                params={"lat": latitude, "lon": longitude, "format": "json"},
-                headers={"User-Agent": "OlinxRA/1.0 (contact@olinxra.com)"}  # User-Agent obrigatório
-            )
-            if rev_resp.status_code == 200:
-                geocode_data = rev_resp.json().get("address", {})
-                logging.info(f"[smart-content] Geocode: {geocode_data.get('city', 'N/A')}, {geocode_data.get('state', 'N/A')}")
-            else:
-                logging.warning(f"[smart-content] Geocode falhou: HTTP {rev_resp.status_code}")
-    except Exception as e:
-        logging.error(f"[smart-content] Erro no geocode: {e}")
     
     # 3. Preparar todas as estratégias de busca em paralelo
     async def try_proximity(radius_m: float):
@@ -1499,18 +1529,26 @@ async def smart_content_lookup(
                 ("pais", geocode_data.get("country"))
             ]
             
-            for tipo_regiao, nome_regiao in regions:
+            # Buscar TODAS as regiões em paralelo (otimização: -1s)
+            async def check_region(tipo_regiao, nome_regiao):
                 if not nome_regiao:
-                    continue
-                
-                # Buscar no banco
+                    return None
                 filtro = {"nome_marca": nome_marca, "tipo_regiao": tipo_regiao, "nome_regiao": nome_regiao}
                 conteudo = await db["conteudos"].find_one(filtro)
-                
                 if conteudo and conteudo.get("blocos"):
                     conteudo["_id"] = str(conteudo["_id"])
                     logging.info(f"[smart-content] ✅ Encontrado em {tipo_regiao}/{nome_regiao}")
                     return ('region', f"{tipo_regiao}/{nome_regiao}", conteudo)
+                return None
+            
+            # Executar todas as buscas em paralelo
+            region_tasks = [check_region(tipo, nome) for tipo, nome in regions]
+            region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
+            
+            # Retornar primeiro resultado válido (prioridade: bairro > cidade > estado > país)
+            for result in region_results:
+                if result and not isinstance(result, Exception):
+                    return result
             
         except Exception as e:
             logging.debug(f"[smart-content] Region lookup falhou: {e}")
