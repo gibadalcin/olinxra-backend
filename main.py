@@ -510,12 +510,12 @@ async def attach_signed_urls_to_blocos(blocos):
                         glb_filename = it.get('glb_filename')
                         if glb_url:
                             try:
-                                # GLBs devem ter expiração longa (365 dias) para app mobile
+                                # GLBs: máximo 7 dias (limite GCS)
                                 glb_signed = await asyncio.to_thread(
                                     gerar_signed_url_conteudo, 
                                     glb_url, 
                                     glb_filename,
-                                    365*24*60*60  # 1 ano
+                                    7*24*60*60  # 7 dias
                                 )
                                 if glb_signed:
                                     it['glb_signed_url'] = glb_signed
@@ -543,12 +543,12 @@ async def attach_signed_urls_to_blocos(blocos):
             glb_filename = b.get('glb_filename')
             if glb_url:
                 try:
-                    # GLBs devem ter expiração longa (365 dias) para app mobile
+                    # GLBs: máximo 7 dias (limite GCS)
                     glb_signed = await asyncio.to_thread(
                         gerar_signed_url_conteudo,
                         glb_url,
                         glb_filename,
-                        365*24*60*60  # 1 ano
+                        7*24*60*60  # 7 dias
                     )
                     if glb_signed:
                         b['glb_signed_url'] = glb_signed
