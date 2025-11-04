@@ -2116,6 +2116,7 @@ async def add_content_image(
     marca: str = Form(""),
     tipo_regiao: str = Form(""),
     nome_regiao: str = Form(""),
+    glb_file: UploadFile = File(None),  # 🆕 GLB customizado opcional
     token: dict = Depends(verify_firebase_token_dep)
 ):
     # Segurança: validar Origin (se fornecido) contra lista de origens permitidas
@@ -2170,10 +2171,71 @@ async def add_content_image(
         except Exception:
             signed = gcs_url
         
-        # 🆕 FASE 1 - Pré-geração automática de GLB para imagens
+        # 🆕 FASE 1 - GLB: customizado (se fornecido) ou auto-gerado da imagem
         glb_url = None
         glb_signed_url = None
-        if file.content_type and file.content_type.startswith('image/'):
+        glb_source = None  # 'custom' ou 'auto_generated'
+        
+        # Verificar se GLB customizado foi fornecido
+        if glb_file and glb_file.filename:
+            # Usuário forneceu GLB customizado - fazer upload direto
+            try:
+                logging.info(f"[add_content_image] GLB customizado fornecido: {glb_file.filename}")
+                
+                # Validar tipo do arquivo GLB
+                if not (glb_file.content_type and 'model' in glb_file.content_type.lower() or 
+                        glb_file.filename.lower().endswith('.glb')):
+                    logging.warning(f"[add_content_image] Tipo de GLB rejeitado: {glb_file.content_type}")
+                    raise HTTPException(status_code=400, detail="Arquivo GLB inválido. Apenas arquivos .glb são aceitos.")
+                
+                # Salvar GLB temporariamente
+                glb_temp_path = None
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as glb_temp_file:
+                    glb_contents = await glb_file.read()
+                    glb_temp_file.write(glb_contents)
+                    glb_temp_path = glb_temp_file.name
+                
+                # Upload GLB customizado para GCS
+                glb_filename = f"{token['uid']}/ra/models/{name_base}.glb"
+                metadata = {
+                    'generated_from_image': gcs_url,
+                    'base_height': '0.0',
+                    'custom_upload': 'true',  # Marca como customizado
+                    'original_filename': glb_file.filename
+                }
+                glb_gcs_url = await asyncio.to_thread(
+                    upload_image_to_gcs,
+                    glb_temp_path,
+                    glb_filename,
+                    'conteudo',
+                    'public, max-age=31536000',
+                    metadata
+                )
+                
+                # Limpar arquivo temporário
+                if glb_temp_path and os.path.exists(glb_temp_path):
+                    os.remove(glb_temp_path)
+                
+                # Gerar signed URL
+                try:
+                    glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=365*24*60*60)
+                    glb_url = glb_gcs_url
+                    glb_source = 'custom'
+                    logging.info(f"[add_content_image] GLB customizado salvo: {glb_filename}")
+                except Exception as e:
+                    logging.warning(f"[add_content_image] Erro ao gerar signed URL do GLB customizado: {e}")
+                    glb_url = glb_gcs_url
+                    glb_source = 'custom'
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                logging.exception(f"[add_content_image] Erro ao processar GLB customizado: {e}")
+                # Se falhar, tenta gerar automaticamente como fallback
+                glb_file = None
+        
+        # Se não foi fornecido GLB customizado E é uma imagem, gerar GLB automaticamente
+        if not glb_url and file.content_type and file.content_type.startswith('image/'):
             try:
                 t_glb_start = time.time()
                 logging.info(f"[add_content_image] Iniciando pré-geração de GLB para {gcs_filename}")
@@ -2217,7 +2279,7 @@ async def add_content_image(
                 metadata = {
                     'generated_from_image': gcs_url,
                     'base_height': '0.0',
-                    'auto_generated': 'true'
+                    'auto_generated': 'true'  # Marca como auto-gerado
                 }
                 glb_gcs_url = await asyncio.to_thread(
                     upload_image_to_gcs,
@@ -2234,11 +2296,13 @@ async def add_content_image(
                 try:
                     glb_signed_url = gerar_signed_url_conteudo(glb_gcs_url, glb_filename, expiration=365*24*60*60)
                     glb_url = glb_gcs_url
+                    glb_source = 'auto_generated'  # Marca origem
                     t_glb_end = time.time()
-                    logging.info(f"[add_content_image] GLB gerado com sucesso em {t_glb_end - t_glb_start:.2f}s: {glb_filename}")
+                    logging.info(f"[add_content_image] GLB auto-gerado com sucesso em {t_glb_end - t_glb_start:.2f}s: {glb_filename}")
                 except Exception as e:
                     logging.warning(f"[add_content_image] Erro ao gerar signed URL do GLB: {e}")
                     glb_url = glb_gcs_url
+                    glb_source = 'auto_generated'
                 
                 # Limpar arquivo temporário do GLB
                 if glb_temp and os.path.exists(glb_temp):
@@ -2252,6 +2316,7 @@ async def add_content_image(
         if glb_url:
             bloco_img["glb_url"] = glb_url
             bloco_img["glb_signed_url"] = glb_signed_url
+            bloco_img["glb_source"] = glb_source  # 'custom' ou 'auto_generated'
         
         t3 = time.time()
         logging.info(f"[add_content_image] Upload concluído (não persiste no DB). Tempo total: {t3-t0:.2f}s")
@@ -2260,7 +2325,7 @@ async def add_content_image(
             resp["temp_id"] = temp_id
         # Log minimal info: uid and filename/type
         try:
-            logging.info(f"[add_content_image] upload ok uid={token.get('uid')} filename={gcs_filename} type={file.content_type} glb={'SIM' if glb_url else 'NÃO'}")
+            logging.info(f"[add_content_image] upload ok uid={token.get('uid')} filename={gcs_filename} type={file.content_type} glb={'SIM' if glb_url else 'NÃO'} glb_source={glb_source if glb_source else 'N/A'}")
         except Exception:
             pass
         return resp
