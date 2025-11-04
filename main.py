@@ -1446,12 +1446,16 @@ async def smart_content_lookup(
     Reduz tempo de ~20s para ~2-3s quando o conteúdo está em região (caso G3).
     """
     
+    logging.info(f"[smart-content] Buscando conteudo para marca={nome_marca}, lat={latitude}, lon={longitude}")
+    
     # 1. Buscar marca
     marca = await logos_collection.find_one({"nome": nome_marca})
     if not marca:
+        logging.warning(f"[smart-content] Marca {nome_marca} nao encontrada")
         return {"conteudo": None, "mensagem": "Marca não encontrada."}
     
     marca_id = marca["_id"]
+    logging.info(f"[smart-content] Marca encontrada: {marca_id}")
     
     # 2. Preparar todas as estratégias de busca em paralelo
     async def try_proximity(radius_m: float):
@@ -1503,6 +1507,7 @@ async def smart_content_lookup(
         return None
     
     # 3. Executar TODAS as estratégias EM PARALELO
+    logging.info("[smart-content] Executando lookups em paralelo...")
     tasks = [
         try_proximity(50),
         try_proximity(200),
@@ -1513,15 +1518,18 @@ async def smart_content_lookup(
     
     # Executar em paralelo e pegar o primeiro resultado
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    logging.info(f"[smart-content] Resultados: {[r is not None and not isinstance(r, Exception) for r in results]}")
     
     # 4. Encontrar primeiro resultado válido
     best_result = None
-    for result in results:
+    for idx, result in enumerate(results):
         if result and not isinstance(result, Exception):
+            logging.info(f"[smart-content] Resultado encontrado na task {idx}: {result[0] if result else None}")
             best_result = result
             break
     
     if not best_result:
+        logging.warning("[smart-content] Nenhum conteudo encontrado")
         return {
             "conteudo": None,
             "mensagem": "Nenhum conteúdo encontrado para esta marca nesta localização."
@@ -1529,6 +1537,7 @@ async def smart_content_lookup(
     
     # 5. Processar resultado encontrado
     strategy, detail, conteudo = best_result
+    logging.info(f"[smart-content] Usando resultado: strategy={strategy}, detail={detail}")
     blocos_doc = conteudo.get('blocos', [])
     
     # Gerar signed URLs em paralelo
