@@ -1457,37 +1457,46 @@ async def smart_content_lookup(
     marca_id = marca["_id"]
     logging.info(f"[smart-content] Marca encontrada: {marca_id}")
     
-    # 2. Preparar todas as estratégias de busca em paralelo
+    # 2. Fazer reverse geocode UMA VEZ (reutilizado por todas as tasks)
+    geocode_data = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            rev_resp = await client.get(
+                f"https://nominatim.openstreetmap.org/reverse",
+                params={"lat": latitude, "lon": longitude, "format": "json"},
+                headers={"User-Agent": "OlinxRA/1.0 (contact@olinxra.com)"}  # User-Agent obrigatório
+            )
+            if rev_resp.status_code == 200:
+                geocode_data = rev_resp.json().get("address", {})
+                logging.info(f"[smart-content] Geocode: {geocode_data.get('city', 'N/A')}, {geocode_data.get('state', 'N/A')}")
+            else:
+                logging.warning(f"[smart-content] Geocode falhou: HTTP {rev_resp.status_code}")
+    except Exception as e:
+        logging.error(f"[smart-content] Erro no geocode: {e}")
+    
+    # 3. Preparar todas as estratégias de busca em paralelo
     async def try_proximity(radius_m: float):
         """Tenta buscar por proximidade com raio específico"""
         try:
             result = await buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude, radius_m)
             if result and result.get('blocos'):
                 return ('proximity', radius_m, result)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"[smart-content] Proximity {radius_m}m falhou: {e}")
         return None
     
     async def try_region_lookup():
-        """Tenta buscar por região usando reverse geocode"""
+        """Tenta buscar por região usando geocode já obtido"""
+        if not geocode_data:
+            return None
+        
         try:
-            # Reverse geocode
-            rev_resp = await httpx.AsyncClient().get(
-                f"https://nominatim.openstreetmap.org/reverse",
-                params={"lat": latitude, "lon": longitude, "format": "json"},
-                timeout=5.0
-            )
-            if rev_resp.status_code != 200:
-                return None
-            
-            addr = rev_resp.json().get("address", {})
-            
             # Tentar hierarquia: bairro → cidade → estado → país
             regions = [
-                ("bairro", addr.get("suburb") or addr.get("neighbourhood")),
-                ("cidade", addr.get("city") or addr.get("town") or addr.get("village")),
-                ("estado", addr.get("state")),
-                ("pais", addr.get("country"))
+                ("bairro", geocode_data.get("suburb") or geocode_data.get("neighbourhood")),
+                ("cidade", geocode_data.get("city") or geocode_data.get("town") or geocode_data.get("village")),
+                ("estado", geocode_data.get("state")),
+                ("pais", geocode_data.get("country"))
             ]
             
             for tipo_regiao, nome_regiao in regions:
@@ -1500,13 +1509,14 @@ async def smart_content_lookup(
                 
                 if conteudo and conteudo.get("blocos"):
                     conteudo["_id"] = str(conteudo["_id"])
+                    logging.info(f"[smart-content] ✅ Encontrado em {tipo_regiao}/{nome_regiao}")
                     return ('region', f"{tipo_regiao}/{nome_regiao}", conteudo)
             
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"[smart-content] Region lookup falhou: {e}")
         return None
     
-    # 3. Executar TODAS as estratégias EM PARALELO
+    # 4. Executar TODAS as estratégias EM PARALELO
     logging.info("[smart-content] Executando lookups em paralelo...")
     tasks = [
         try_proximity(50),
@@ -1520,30 +1530,29 @@ async def smart_content_lookup(
     results = await asyncio.gather(*tasks, return_exceptions=True)
     logging.info(f"[smart-content] Resultados: {[r is not None and not isinstance(r, Exception) for r in results]}")
     
-    # 4. Encontrar primeiro resultado válido
+    # 5. Encontrar primeiro resultado válido
     best_result = None
     for idx, result in enumerate(results):
         if result and not isinstance(result, Exception):
-            logging.info(f"[smart-content] Resultado encontrado na task {idx}: {result[0] if result else None}")
             best_result = result
             break
     
     if not best_result:
-        logging.warning("[smart-content] Nenhum conteudo encontrado")
+        logging.warning("[smart-content] ❌ Nenhum conteudo encontrado")
         return {
             "conteudo": None,
             "mensagem": "Nenhum conteúdo encontrado para esta marca nesta localização."
         }
     
-    # 5. Processar resultado encontrado
+    # 6. Processar resultado encontrado
     strategy, detail, conteudo = best_result
-    logging.info(f"[smart-content] Usando resultado: strategy={strategy}, detail={detail}")
+    logging.info(f"[smart-content] ✅ Usando resultado: strategy={strategy}, detail={detail}")
     blocos_doc = conteudo.get('blocos', [])
     
     # Gerar signed URLs em paralelo
     await attach_signed_urls_to_blocos(blocos_doc)
     
-    # 6. Montar resposta
+    # 7. Montar resposta
     resultado = {
         "conteudo": {"blocos": blocos_doc},
         "mensagem": "Conteúdo encontrado.",
@@ -1553,6 +1562,7 @@ async def smart_content_lookup(
         "matched_detail": detail
     }
     
+    logging.info(f"[smart-content] 🎯 Retornando conteudo com {len(blocos_doc)} blocos")
     if conteudo.get('radius_m') is not None:
         resultado['radius_m'] = conteudo.get('radius_m')
     
