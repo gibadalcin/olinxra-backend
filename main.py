@@ -1430,6 +1430,126 @@ async def consulta_conteudo(
     consulta_cache[cache_key] = resultado
     return resultado
 
+
+@app.post('/api/smart-content')
+async def smart_content_lookup(
+    nome_marca: str = Body(...),
+    latitude: float = Body(...),
+    longitude: float = Body(...)
+):
+    """
+    🚀 ENDPOINT OTIMIZADO - Faz lookup paralelo em todas as estratégias
+    
+    Ao invés de tentar sequencialmente (consulta → radius 50m → 200m → 1000m → 5000m → geocode → região),
+    este endpoint executa TODAS as estratégias EM PARALELO e retorna assim que a primeira encontrar resultado.
+    
+    Reduz tempo de ~20s para ~2-3s quando o conteúdo está em região (caso G3).
+    """
+    
+    # 1. Buscar marca
+    marca = await logos_collection.find_one({"nome": nome_marca})
+    if not marca:
+        return {"conteudo": None, "mensagem": "Marca não encontrada."}
+    
+    marca_id = marca["_id"]
+    
+    # 2. Preparar todas as estratégias de busca em paralelo
+    async def try_proximity(radius_m: float):
+        """Tenta buscar por proximidade com raio específico"""
+        try:
+            result = await buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude, radius_m)
+            if result and result.get('blocos'):
+                return ('proximity', radius_m, result)
+        except Exception:
+            pass
+        return None
+    
+    async def try_region_lookup():
+        """Tenta buscar por região usando reverse geocode"""
+        try:
+            # Reverse geocode
+            rev_resp = await httpx.AsyncClient().get(
+                f"https://nominatim.openstreetmap.org/reverse",
+                params={"lat": latitude, "lon": longitude, "format": "json"},
+                timeout=5.0
+            )
+            if rev_resp.status_code != 200:
+                return None
+            
+            addr = rev_resp.json().get("address", {})
+            
+            # Tentar hierarquia: bairro → cidade → estado → país
+            regions = [
+                ("bairro", addr.get("suburb") or addr.get("neighbourhood")),
+                ("cidade", addr.get("city") or addr.get("town") or addr.get("village")),
+                ("estado", addr.get("state")),
+                ("pais", addr.get("country"))
+            ]
+            
+            for tipo_regiao, nome_regiao in regions:
+                if not nome_regiao:
+                    continue
+                
+                # Buscar no banco
+                filtro = {"nome_marca": nome_marca, "tipo_regiao": tipo_regiao, "nome_regiao": nome_regiao}
+                conteudo = await db["conteudos"].find_one(filtro)
+                
+                if conteudo and conteudo.get("blocos"):
+                    conteudo["_id"] = str(conteudo["_id"])
+                    return ('region', f"{tipo_regiao}/{nome_regiao}", conteudo)
+            
+        except Exception:
+            pass
+        return None
+    
+    # 3. Executar TODAS as estratégias EM PARALELO
+    tasks = [
+        try_proximity(50),
+        try_proximity(200),
+        try_proximity(1000),
+        try_proximity(5000),
+        try_region_lookup()
+    ]
+    
+    # Executar em paralelo e pegar o primeiro resultado
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # 4. Encontrar primeiro resultado válido
+    best_result = None
+    for result in results:
+        if result and not isinstance(result, Exception):
+            best_result = result
+            break
+    
+    if not best_result:
+        return {
+            "conteudo": None,
+            "mensagem": "Nenhum conteúdo encontrado para esta marca nesta localização."
+        }
+    
+    # 5. Processar resultado encontrado
+    strategy, detail, conteudo = best_result
+    blocos_doc = conteudo.get('blocos', [])
+    
+    # Gerar signed URLs em paralelo
+    await attach_signed_urls_to_blocos(blocos_doc)
+    
+    # 6. Montar resposta
+    resultado = {
+        "conteudo": {"blocos": blocos_doc},
+        "mensagem": "Conteúdo encontrado.",
+        "tipo_regiao": conteudo.get('tipo_regiao'),
+        "nome_regiao": conteudo.get('nome_regiao'),
+        "matched_by": strategy,
+        "matched_detail": detail
+    }
+    
+    if conteudo.get('radius_m') is not None:
+        resultado['radius_m'] = conteudo.get('radius_m')
+    
+    return resultado
+
+
 @app.get('/api/marcas')
 async def listar_marcas(
     ownerId: str = Query(..., description="ID do usuário dono das marcas"),
