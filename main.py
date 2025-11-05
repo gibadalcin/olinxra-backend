@@ -2103,7 +2103,7 @@ async def post_conteudo(
                                         break
 
                             # copy other optional decorative/button props if present
-                            for fld in ('variant', 'color', 'icon', 'size', 'disabled', 'aria_label', 'analytics', 'visibility', 'position', 'temp_id'):
+                            for fld in ('variant', 'color', 'icon', 'icon_family', 'icon_invert', 'size', 'disabled', 'aria_label', 'analytics', 'visibility', 'position', 'temp_id'):
                                 if bb.get(fld) is None and meta.get(fld) is not None:
                                     bb[fld] = meta.get(fld)
 
