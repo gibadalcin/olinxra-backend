@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from bson.errors import InvalidId
 from datetime import timedelta, datetime
+import uuid
 from gcs_utils import upload_image_to_gcs, get_bucket, GCS_BUCKET_CONTEUDO, GCS_BUCKET_LOGOS
 from google.api_core.exceptions import PreconditionFailed
 from glb_generator import generate_plane_glb
@@ -44,6 +45,66 @@ logos_collection = None
 # Cache de geocoding em memória (otimização para evitar chamadas repetidas ao Nominatim)
 geocode_cache = {}
 # REMOVIDO: images_collection = None
+
+
+async def uploaded_assets_cleanup_worker(db, stop_event: asyncio.Event, interval_hours: int = 24, ttl_days: int = 7):
+    """Background worker that periodically cleans uploaded_assets marked as unattached
+    older than ttl_days. Deletes GCS objects (image + glb) and removes DB records.
+    The worker stops when stop_event is set.
+    """
+    interval_seconds = max(60, int(interval_hours) * 3600)
+    ttl_days = int(ttl_days)
+    logging.info(f"[cleanup_worker] iniciado: intervalo={interval_hours}h ttl_days={ttl_days}")
+    from gcs_utils import delete_gs_path
+
+    while True:
+        try:
+            threshold = datetime.utcnow() - timedelta(days=ttl_days)
+            try:
+                orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
+            except Exception:
+                logging.exception('[cleanup_worker] Falha ao buscar uploaded_assets órfãos')
+                orphans = []
+
+            for a in orphans:
+                try:
+                    fname = a.get('filename')
+                    # safety: check if any conteudo references this filename
+                    ref = await db['conteudos'].find_one({'$or': [{'blocos.filename': fname}, {'blocos.items.filename': fname}]})
+                    if ref:
+                        # mark attached to avoid deletion
+                        await db['uploaded_assets'].update_one({'_id': a['_id']}, {'$set': {'attached': True, 'attached_at': datetime.utcnow(), 'conteudo_id': str(ref.get('_id'))}})
+                        logging.info(f"[cleanup_worker] asset {a.get('_id')} referenced by conteudo {ref.get('_id')}, marcado como attached")
+                        continue
+
+                    # delete files (image + glb)
+                    try:
+                        if a.get('gs_url'):
+                            await asyncio.to_thread(delete_gs_path, a.get('gs_url'))
+                    except Exception:
+                        logging.exception('[cleanup_worker] Falha ao deletar gs_url')
+                    try:
+                        if a.get('glb_url'):
+                            await asyncio.to_thread(delete_gs_path, a.get('glb_url'))
+                    except Exception:
+                        logging.exception('[cleanup_worker] Falha ao deletar glb_url')
+
+                    await db['uploaded_assets'].delete_one({'_id': a['_id']})
+                    logging.info(f"[cleanup_worker] asset {a.get('_id')} deletado")
+                except Exception:
+                    logging.exception('[cleanup_worker] Erro ao processar asset')
+
+        except Exception:
+            logging.exception('[cleanup_worker] Erro inesperado no loop principal')
+
+        # wait for interval or stop
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            logging.info('[cleanup_worker] stop_event set, encerrando worker')
+            break
+        except asyncio.TimeoutError:
+            # timeout expired, loop again
+            continue
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,6 +147,12 @@ async def lifespan(app: FastAPI):
 
         # Índice simples por owner_uid
         await db['conteudos'].create_index([('owner_uid', 1)], name='idx_owner_uid')
+        # Índice para assets temporários (staged uploads). TTL de 7 dias.
+        try:
+            await db['uploaded_assets'].create_index([('created_at', 1)], expireAfterSeconds=7*24*3600)
+            logging.info('Índice TTL criado para uploaded_assets (7 dias)')
+        except Exception:
+            logging.exception('Falha ao criar índice TTL para uploaded_assets')
 
         logging.info('Índices de conteúdo verificados/criados com sucesso.')
     except Exception as e:
@@ -96,9 +163,37 @@ async def lifespan(app: FastAPI):
     initialize_firebase()
     initialize_onnx_session()
     await load_faiss_index()
-    yield
-    if client:
-        client.close()
+    # Start background cleanup worker for uploaded_assets
+    try:
+        cleanup_interval = int(os.getenv('CLEANUP_INTERVAL_HOURS', '24'))
+    except Exception:
+        cleanup_interval = 24
+    try:
+        ttl_days = int(os.getenv('UPLOADED_ASSETS_TTL_DAYS', '7'))
+    except Exception:
+        ttl_days = 7
+
+    stop_event = asyncio.Event()
+    cleanup_task = asyncio.create_task(uploaded_assets_cleanup_worker(db, stop_event, cleanup_interval, ttl_days))
+
+    try:
+        yield
+    finally:
+        # signal worker to stop and wait for it to finish
+        try:
+            stop_event.set()
+            # allow up to 30s for graceful shutdown
+            await asyncio.wait_for(cleanup_task, timeout=30.0)
+        except asyncio.TimeoutError:
+            logging.warning('[lifespan] cleanup_task did not finish within timeout, cancelling')
+            try:
+                cleanup_task.cancel()
+            except Exception:
+                pass
+        except Exception:
+            logging.exception('[lifespan] error while shutting down cleanup_task')
+        if client:
+            client.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -725,6 +820,98 @@ async def _search_and_compare_logic(file: UploadFile):
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@app.post('/upload/cancel')
+async def upload_cancel(
+    temp_id: str = Body(None),
+    filename: str = Body(None),
+    token: dict = Depends(verify_firebase_token_dep)
+):
+    """Cancel a staged upload (uploaded_assets). Accepts either temp_id or filename.
+    Deletes GCS objects (image + glb) and removes uploaded_assets record.
+    """
+    if not temp_id and not filename:
+        raise HTTPException(status_code=400, detail='temp_id or filename required')
+    try:
+        query = {'owner_uid': token.get('uid')}
+        if temp_id:
+            query['temp_id'] = temp_id
+        else:
+            query['filename'] = filename
+
+        asset = await db['uploaded_assets'].find_one(query)
+        if not asset:
+            return {'ok': True, 'message': 'asset not found'}
+
+        from gcs_utils import delete_gs_path
+        # delete image
+        try:
+            if asset.get('gs_url'):
+                await asyncio.to_thread(delete_gs_path, asset.get('gs_url'))
+        except Exception:
+            logging.exception('[upload_cancel] Falha ao deletar gs_url (continuando)')
+        # delete glb if present
+        try:
+            if asset.get('glb_url'):
+                await asyncio.to_thread(delete_gs_path, asset.get('glb_url'))
+        except Exception:
+            logging.exception('[upload_cancel] Falha ao deletar glb_url (continuando)')
+
+        await db['uploaded_assets'].delete_one({'_id': asset['_id']})
+        return {'ok': True, 'deleted': True}
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception('[upload_cancel] Erro ao cancelar upload')
+        raise HTTPException(status_code=500, detail='internal error')
+
+
+@app.post('/admin/cleanup-uploaded-assets')
+async def admin_cleanup_uploaded_assets(token: dict = Depends(verify_firebase_token_dep)):
+    # Only allow master admin to trigger
+    master_email = os.getenv('USER_ADMIN_EMAIL')
+    if token.get('email') != master_email:
+        raise HTTPException(status_code=403, detail='Forbidden')
+
+    threshold = datetime.utcnow() - timedelta(days=7)
+    processed = []
+    try:
+        orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
+        from gcs_utils import delete_gs_path
+        for a in orphans:
+            try:
+                fname = a.get('filename')
+                # safety: check if any conteudo references this filename
+                ref = await db['conteudos'].find_one({'$or': [{'blocos.filename': fname}, {'blocos.items.filename': fname}]})
+                if ref:
+                    # mark attached to avoid deletion
+                    await db['uploaded_assets'].update_one({'_id': a['_id']}, {'$set': {'attached': True, 'attached_at': datetime.utcnow(), 'conteudo_id': str(ref.get('_id'))}})
+                    processed.append({'id': str(a.get('_id')), 'status': 'referenced'})
+                    continue
+
+                # delete files
+                try:
+                    if a.get('gs_url'):
+                        await asyncio.to_thread(delete_gs_path, a.get('gs_url'))
+                except Exception:
+                    logging.exception('[admin_cleanup] Falha ao deletar gs_url')
+                try:
+                    if a.get('glb_url'):
+                        await asyncio.to_thread(delete_gs_path, a.get('glb_url'))
+                except Exception:
+                    logging.exception('[admin_cleanup] Falha ao deletar glb_url')
+
+                await db['uploaded_assets'].delete_one({'_id': a['_id']})
+                processed.append({'id': str(a.get('_id')), 'status': 'deleted'})
+            except Exception:
+                logging.exception('[admin_cleanup] Erro ao processar asset')
+                processed.append({'id': str(a.get('_id')), 'status': 'error'})
+    except Exception:
+        logging.exception('[admin_cleanup] Erro ao buscar assets órfãos')
+        raise HTTPException(status_code=500, detail='internal error')
+
+    return {'processed': processed, 'count': len(processed)}
 
 
 @app.post('/api/validate-button-block')
@@ -2232,9 +2419,133 @@ async def post_conteudo(
         # mas garante que cada bloco enviado gere uma entrada no documento.
         if existente:
             try:
-                # Substitui os blocos existentes pelo payload recebido.
-                # Isso evita duplicações quando o frontend carrega os blocos,
-                # edita um existente e envia o estado completo de volta.
+                # Antes de substituir blocos, MESCLAR campos gerenciados pelo servidor
+                # (por exemplo: glb_url, glb_signed_url, glb_source) para o caso em
+                # que o frontend não reenvie esses campos ao editar o conteúdo.
+                # Critério de match: filename (preferencial) ou url.
+                try:
+                    old_blocos = existente.get('blocos', []) or []
+
+                    # Indexar blocos antigos por filename e url para busca rápida
+                    old_by_filename = {}
+                    old_by_url = {}
+                    for ob in old_blocos:
+                        try:
+                            if not isinstance(ob, dict):
+                                continue
+                            fn = ob.get('filename') or ob.get('nome')
+                            if fn:
+                                old_by_filename[str(fn)] = ob
+                            u = ob.get('url')
+                            if u:
+                                old_by_url[str(u)] = ob
+
+                            # indexar items dentro de carousels também
+                            if ob.get('items') and isinstance(ob.get('items'), list):
+                                for it in ob.get('items'):
+                                    try:
+                                        if not isinstance(it, dict):
+                                            continue
+                                        it_fn = it.get('filename') or it.get('nome')
+                                        if it_fn:
+                                            old_by_filename[str(it_fn)] = it
+                                        it_u = it.get('url')
+                                        if it_u:
+                                            old_by_url[str(it_u)] = it
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            continue
+
+                    # Também considerar uploaded_assets (staged uploads) para o owner,
+                    # caso o frontend não tenha persistido glb_* no bloco enviado.
+                    try:
+                        filenames_to_lookup = set()
+                        for nb in cleaned_blocos:
+                            try:
+                                fnn = nb.get('filename') or nb.get('nome')
+                                if fnn:
+                                    filenames_to_lookup.add(str(fnn))
+                                if nb.get('items') and isinstance(nb.get('items'), list):
+                                    for it in nb.get('items'):
+                                        try:
+                                            if not isinstance(it, dict):
+                                                continue
+                                            it_fn = it.get('filename') or it.get('nome')
+                                            if it_fn:
+                                                filenames_to_lookup.add(str(it_fn))
+                                        except Exception:
+                                            continue
+                            except Exception:
+                                continue
+
+                        if filenames_to_lookup:
+                            try:
+                                assets = await db['uploaded_assets'].find({'owner_uid': token.get('uid'), 'filename': {'$in': list(filenames_to_lookup)}}).to_list(length=1000)
+                                for a in assets:
+                                    try:
+                                        if a.get('filename'):
+                                            # hlas assembe a entrada para merge (conteúdo do asset contém glb_* )
+                                            old_by_filename[str(a.get('filename'))] = a
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                logging.exception('[post_conteudo] Falha ao buscar uploaded_assets para merge')
+                    except Exception:
+                        pass
+
+                    # Função auxiliar: copia campos server-managed se existirem no bloco antigo
+                    def copy_server_fields(src, dst):
+                        if not src or not dst or not isinstance(src, dict) or not isinstance(dst, dict):
+                            return
+                        for fld in ('glb_url', 'glb_signed_url', 'glb_source'):
+                            if fld in src and (fld not in dst or dst.get(fld) in (None, '')):
+                                try:
+                                    dst[fld] = src.get(fld)
+                                except Exception:
+                                    pass
+
+                    # Para cada bloco novo, tentar mesclar campos do bloco antigo correspondente
+                    for nb in cleaned_blocos:
+                        try:
+                            if not isinstance(nb, dict):
+                                continue
+                            matched = None
+                            # procura por filename primeiro
+                            fn = nb.get('filename') or nb.get('nome')
+                            if fn and str(fn) in old_by_filename:
+                                matched = old_by_filename.get(str(fn))
+                            # senao por url
+                            if not matched:
+                                u = nb.get('url')
+                                if u and str(u) in old_by_url:
+                                    matched = old_by_url.get(str(u))
+                            # se encontrou, copia campos
+                            if matched:
+                                copy_server_fields(matched, nb)
+
+                            # se for carousel, tratar items individualmente
+                            if nb.get('items') and isinstance(nb.get('items'), list):
+                                for it in nb['items']:
+                                    try:
+                                        if not isinstance(it, dict):
+                                            continue
+                                        matched_it = None
+                                        it_fn = it.get('filename') or it.get('nome')
+                                        if it_fn and str(it_fn) in old_by_filename:
+                                            matched_it = old_by_filename.get(str(it_fn))
+                                        if not matched_it:
+                                            it_u = it.get('url')
+                                            if it_u and str(it_u) in old_by_url:
+                                                matched_it = old_by_url.get(str(it_u))
+                                        if matched_it:
+                                            copy_server_fields(matched_it, it)
+                                    except Exception:
+                                        continue
+                except Exception:
+                    logging.exception('[post_conteudo] Falha ao mesclar campos server-managed dos blocos antigos (seguir com replace)')
+
+                # Substitui os blocos existentes pelo payload recebido (já mesclados acima).
                 update_doc = {
                     **base_filtro,
                     'blocos': list(cleaned_blocos),
@@ -2321,6 +2632,32 @@ async def post_conteudo(
                 if saved:
                     # converte _id para string se necessário
                     saved['_id'] = str(saved['_id'])
+                    # Marcar uploaded_assets como attached quando houver correspondência por filename
+                    try:
+                        filenames_to_mark = set()
+                        for b in (saved.get('blocos') or []):
+                            try:
+                                if b and isinstance(b, dict):
+                                    fn = b.get('filename') or b.get('nome')
+                                    if fn: filenames_to_mark.add(str(fn))
+                                    if b.get('items') and isinstance(b.get('items'), list):
+                                        for it in b.get('items'):
+                                            try:
+                                                if it and isinstance(it, dict):
+                                                    it_fn = it.get('filename') or it.get('nome')
+                                                    if it_fn: filenames_to_mark.add(str(it_fn))
+                                            except Exception:
+                                                continue
+                            except Exception:
+                                continue
+                        if filenames_to_mark:
+                            await db['uploaded_assets'].update_many(
+                                {'owner_uid': token.get('uid'), 'filename': {'$in': list(filenames_to_mark)}},
+                                {'$set': {'attached': True, 'attached_at': datetime.utcnow(), 'conteudo_id': saved['_id']}}
+                            )
+                    except Exception:
+                        logging.exception('[post_conteudo] Falha ao marcar uploaded_assets como attached (não-fatal)')
+
                     return { 'action': 'saved', 'blocos': saved.get('blocos', []) }
                 return { 'action': 'saved' }
             except Exception as e:
@@ -2347,6 +2684,32 @@ async def post_conteudo(
             saved = await db['conteudos'].find_one({'_id': result.inserted_id})
             if saved:
                 saved['_id'] = str(saved['_id'])
+                # Marcar uploaded_assets como attached para os filenames do novo documento
+                try:
+                    filenames_to_mark = set()
+                    for b in (saved.get('blocos') or []):
+                        try:
+                            if b and isinstance(b, dict):
+                                fn = b.get('filename') or b.get('nome')
+                                if fn: filenames_to_mark.add(str(fn))
+                                if b.get('items') and isinstance(b.get('items'), list):
+                                    for it in b.get('items'):
+                                        try:
+                                            if it and isinstance(it, dict):
+                                                it_fn = it.get('filename') or it.get('nome')
+                                                if it_fn: filenames_to_mark.add(str(it_fn))
+                                        except Exception:
+                                            continue
+                        except Exception:
+                            continue
+                    if filenames_to_mark:
+                        await db['uploaded_assets'].update_many(
+                            {'owner_uid': token.get('uid'), 'filename': {'$in': list(filenames_to_mark)}},
+                            {'$set': {'attached': True, 'attached_at': datetime.utcnow(), 'conteudo_id': saved['_id']}}
+                        )
+                except Exception:
+                    logging.exception('[post_conteudo] Falha ao marcar uploaded_assets como attached (não-fatal)')
+
                 return { 'action': 'saved', 'blocos': saved.get('blocos', []) }
             return { 'action': 'saved' }
     except HTTPException:
@@ -2612,6 +2975,26 @@ async def add_content_image(
             logging.info(f"[add_content_image] upload ok uid={token.get('uid')} filename={gcs_filename} type={file.content_type} glb={'SIM' if glb_url else 'NÃO'} glb_source={glb_source if glb_source else 'N/A'}")
         except Exception:
             pass
+        # Persistir metadados do upload em uploaded_assets (staged) para permitir
+        # associação posterior mesmo que o frontend não reenvie glb_* no post_conteudo.
+        try:
+            asset_temp_id = temp_id or str(uuid.uuid4())
+            asset_doc = {
+                'owner_uid': token.get('uid'),
+                'filename': gcs_filename,
+                'gs_url': gcs_url,
+                'glb_url': glb_url,
+                'glb_filename': (glb_url and f"{token['uid']}/ra/models/{os.path.splitext(name)[0]}.glb") or None,
+                'glb_source': glb_source,
+                'temp_id': asset_temp_id,
+                'attached': False,
+                'created_at': datetime.utcnow()
+            }
+            await db['uploaded_assets'].update_one({'owner_uid': token.get('uid'), 'filename': gcs_filename}, {'$set': asset_doc}, upsert=True)
+            resp['temp_id'] = asset_temp_id
+        except Exception:
+            logging.exception('[add_content_image] Falha ao persistir uploaded_assets (não-fatal)')
+
         return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao adicionar conteúdo: {str(e)}")
