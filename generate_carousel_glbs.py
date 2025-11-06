@@ -121,13 +121,13 @@ async def generate_glbs_for_carousel():
                             metadata
                         )
                         
-                        # 5. Gerar signed URL
+                        # 5. Gerar signed URL (máximo 7 dias = 604800 segundos)
                         print(f"      🔐 Gerando signed URL...")
                         glb_signed_url = await asyncio.to_thread(
                             gerar_signed_url_conteudo,
                             glb_gcs_url,
                             glb_filename,
-                            365*24*60*60  # 1 ano
+                            7*24*60*60  # 7 dias (máximo permitido pelo GCS)
                         )
                         
                         # 6. Atualizar item no documento
