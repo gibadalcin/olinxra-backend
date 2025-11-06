@@ -247,6 +247,30 @@ def sanitize_for_json(obj):
     return obj
 
 
+def resize_image_if_needed(src_path: str, max_dim: int = 2048) -> str:
+    """
+    Redimensiona imagem se exceder dimensão máxima, mantendo aspect ratio.
+    
+    Args:
+        src_path: Caminho para arquivo de imagem
+        max_dim: Dimensão máxima permitida (largura ou altura)
+    
+    Returns:
+        Caminho para imagem processada (original se não precisou redimensionar)
+    """
+    img = PILImage.open(src_path)
+    w, h = img.size
+    if max(w, h) > max_dim:
+        ratio = max_dim / float(max(w, h))
+        new_size = (int(w * ratio), int(h * ratio))
+        img = img.convert('RGB')
+        img = img.resize(new_size, PILImage.LANCZOS)
+        dst = src_path + '.resized.jpg'
+        img.save(dst, format='JPEG', quality=90)
+        return dst
+    return src_path
+
+
 # --- Helpers de Inicialização ---
 ###############################################################
 # Função utilitária e endpoint para gerar signed URL de conteúdo
@@ -1253,20 +1277,7 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
                             tf.write(chunk)
 
         # Resize/normalize image if too big in dimensions (run in thread)
-        def _resize_if_needed(src_path, max_dim):
-            img = PILImage.open(src_path)
-            w, h = img.size
-            if max(w, h) > max_dim:
-                ratio = max_dim / float(max(w, h))
-                new_size = (int(w * ratio), int(h * ratio))
-                img = img.convert('RGB')
-                img = img.resize(new_size, PILImage.LANCZOS)
-                dst = src_path + '.resized.jpg'
-                img.save(dst, format='JPEG', quality=90)
-                return dst
-            return src_path
-
-        processed_image = await asyncio.to_thread(_resize_if_needed, temp_image, MAX_IMAGE_DIM)
+        processed_image = await asyncio.to_thread(resize_image_if_needed, temp_image, MAX_IMAGE_DIM)
 
         # generate glb (but first try to acquire a lightweight generation lock/marker
         # to avoid multiple processes doing the expensive generation concurrently)
@@ -1645,8 +1656,16 @@ async def api_reverse_geocode(lat: float = Query(...), lon: float = Query(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na geocodificação reversa: {str(e)}")
 
-# Cache em memória: {(nome_marca, latitude, longitude): resultado}
+# Cache em memória: {(nome_marca, latitude, longitude, radius): resultado}
 consulta_cache = {}
+CONSULTA_CACHE_MAX_SIZE = 1000
+
+def add_to_consulta_cache(key, value):
+    """Adiciona item ao cache de consulta com limite de tamanho (FIFO)"""
+    if len(consulta_cache) >= CONSULTA_CACHE_MAX_SIZE:
+        # Remove item mais antigo (primeiro inserido)
+        consulta_cache.pop(next(iter(consulta_cache)))
+    consulta_cache[key] = value
 
 def make_cache_key(nome_marca, latitude, longitude):
     # Arredonda para evitar pequenas variações
@@ -1668,7 +1687,7 @@ async def consulta_conteudo(
     marca = await logos_collection.find_one({"nome": nome_marca})
     if not marca:
         resultado = {"conteudo": None, "mensagem": "Marca não encontrada."}
-        consulta_cache[cache_key] = resultado
+        add_to_consulta_cache(cache_key, resultado)
         return resultado
 
     # Busca conteúdo associado à marca e localização usando a função
@@ -1735,7 +1754,7 @@ async def consulta_conteudo(
             "endereco": endereco
         }
 
-    consulta_cache[cache_key] = resultado
+    add_to_consulta_cache(cache_key, resultado)
     return resultado
 
 
@@ -1930,7 +1949,7 @@ async def get_conteudo(
     marca = await logos_collection.find_one({"nome": nome_marca})
     if not marca:
         resultado = {"conteudo": None, "mensagem": "Marca não encontrada."}
-        consulta_cache[cache_key] = resultado
+        add_to_consulta_cache(cache_key, resultado)
         return resultado
 
     conteudo = await buscar_conteudo_por_marca_e_localizacao(marca["_id"], latitude, longitude, radius)
@@ -1975,7 +1994,7 @@ async def get_conteudo(
             "localizacao": local_str
         }
 
-    consulta_cache[cache_key] = resultado
+    add_to_consulta_cache(cache_key, resultado)
     return resultado
 
 @app.get('/api/conteudo-por-regiao')
@@ -2542,6 +2561,8 @@ async def post_conteudo(
                                             copy_server_fields(matched_it, it)
                                     except Exception:
                                         continue
+                        except Exception:
+                            continue
                 except Exception:
                     logging.exception('[post_conteudo] Falha ao mesclar campos server-managed dos blocos antigos (seguir com replace)')
 
@@ -2893,20 +2914,7 @@ async def add_content_image(
                 
                 # Resize se necessário (mesma lógica do endpoint generate-glb)
                 MAX_IMAGE_DIM = int(os.getenv('GLB_MAX_DIM', '2048'))
-                def _resize_if_needed(src_path, max_dim):
-                    img = PILImage.open(src_path)
-                    w, h = img.size
-                    if max(w, h) > max_dim:
-                        ratio = max_dim / float(max(w, h))
-                        new_size = (int(w * ratio), int(h * ratio))
-                        img = img.convert('RGB')
-                        img = img.resize(new_size, PILImage.LANCZOS)
-                        dst = src_path + '.resized.jpg'
-                        img.save(dst, format='JPEG', quality=90)
-                        return dst
-                    return src_path
-                
-                processed_image = await asyncio.to_thread(_resize_if_needed, temp_path, MAX_IMAGE_DIM)
+                processed_image = await asyncio.to_thread(resize_image_if_needed, temp_path, MAX_IMAGE_DIM)
                 
                 # Gerar GLB
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.glb') as tg:
