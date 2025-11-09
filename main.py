@@ -732,6 +732,47 @@ async def attach_signed_urls_to_blocos_fast(blocos):
                             expiration=7*24*60*60, skip_exists_check=True
                         ))
                         task_metadata.append((it, 'signed_url', 'image'))
+
+                        # Tentativa de gerar também uma preview (thumbnail) assinada
+                        # Priorizar campos explícitos se existirem
+                        preview_fn = None
+                        # campos possíveis fornecidos pelo uploader/DB
+                        if isinstance(it.get('preview_filename'), str):
+                            preview_fn = it.get('preview_filename')
+                        elif isinstance(it.get('thumb_filename'), str):
+                            preview_fn = it.get('thumb_filename')
+                        elif it.get('meta') and isinstance(it['meta'].get('preview_filename'), str):
+                            preview_fn = it['meta'].get('preview_filename')
+
+                        # Se não há preview explícita, derivar variantes comuns
+                        if not preview_fn and filename and isinstance(filename, str):
+                            name, dot, ext = filename.rpartition('.')
+                            base = name if name else filename
+                            # Tentar sufixos comuns: _t, _s, -thumb
+                            candidates = [f"{base}_t.{ext}" if ext else f"{base}_t",
+                                          f"{base}_s.{ext}" if ext else f"{base}_s",
+                                          f"{base}-thumb.{ext}" if ext else f"{base}-thumb"]
+                            # use first candidate that exists (we skip exists check for perf and will return None if not found)
+                            preview_fn = candidates[0]
+
+                        if preview_fn:
+                            # If original url was a gs:// form, try to turn into gs://.../preview_fn
+                            preview_gs = None
+                            if url and isinstance(url, str) and url.startswith('gs://'):
+                                # replace tail filename with preview_fn
+                                parts = url.split('/')
+                                if len(parts) >= 4:
+                                    preview_gs = '/'.join(parts[:3] + [preview_fn])
+                                else:
+                                    preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+                            else:
+                                preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+
+                            tasks.append(asyncio.to_thread(
+                                gerar_signed_url_conteudo, preview_gs, preview_fn,
+                                expiration=7*24*60*60, skip_exists_check=True
+                            ))
+                            task_metadata.append((it, 'preview_signed_url', 'image_preview'))
                     
                     # URL do GLB (TTL 7 dias)
                     glb_url = it.get('glb_url')
@@ -755,6 +796,37 @@ async def attach_signed_urls_to_blocos_fast(blocos):
                     expiration=7*24*60*60, skip_exists_check=True
                 ))
                 task_metadata.append((b, 'signed_url', 'image'))
+
+            # Para single media blocks, também tentar gerar preview_signed_url
+            preview_fn = None
+            if isinstance(b.get('preview_filename'), str):
+                preview_fn = b.get('preview_filename')
+            elif isinstance(b.get('thumb_filename'), str):
+                preview_fn = b.get('thumb_filename')
+            elif b.get('meta') and isinstance(b['meta'].get('preview_filename'), str):
+                preview_fn = b['meta'].get('preview_filename')
+
+            if not preview_fn and filename and isinstance(filename, str):
+                name, dot, ext = filename.rpartition('.')
+                base = name if name else filename
+                preview_fn = f"{base}_t.{ext}" if ext else f"{base}_t"
+
+            if preview_fn:
+                preview_gs = None
+                if url and isinstance(url, str) and url.startswith('gs://'):
+                    parts = url.split('/')
+                    if len(parts) >= 4:
+                        preview_gs = '/'.join(parts[:3] + [preview_fn])
+                    else:
+                        preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+                else:
+                    preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+
+                tasks.append(asyncio.to_thread(
+                    gerar_signed_url_conteudo, preview_gs, preview_fn,
+                    expiration=7*24*60*60, skip_exists_check=True
+                ))
+                task_metadata.append((b, 'preview_signed_url', 'image_preview'))
             
             # Single media block - GLB (TTL 7 dias)
             glb_url = b.get('glb_url')
