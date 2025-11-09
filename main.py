@@ -858,10 +858,14 @@ async def attach_signed_urls_to_blocos_fast(blocos):
                             else:
                                 preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
 
-                            tasks.append(asyncio.to_thread(
-                                gerar_signed_url_conteudo, preview_gs, preview_fn,
-                                expiration=7*24*60*60, skip_exists_check=True
-                            ))
+                                # Para previews, é preferível verificar a existência do objeto
+                                # antes de retornar uma preview_signed_url para evitar 404s no cliente.
+                                # Mantemos skip_exists_check=True para os arquivos principais,
+                                # mas para thumbnails/previews vamos fazer a verificação.
+                                tasks.append(asyncio.to_thread(
+                                    gerar_signed_url_conteudo, preview_gs, preview_fn,
+                                    expiration=7*24*60*60, skip_exists_check=False
+                                ))
                             task_metadata.append((it, 'preview_signed_url', 'image_preview'))
                     
                     # URL do GLB (TTL 7 dias)
@@ -911,10 +915,11 @@ async def attach_signed_urls_to_blocos_fast(blocos):
                         preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
                 else:
                     preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
-
+                # Verificar existência do preview antes de anexar (fast-path preserva
+                # a otimização para imagens principais, mas queremos evitar previews 404)
                 tasks.append(asyncio.to_thread(
                     gerar_signed_url_conteudo, preview_gs, preview_fn,
-                    expiration=7*24*60*60, skip_exists_check=True
+                    expiration=7*24*60*60, skip_exists_check=False
                 ))
                 task_metadata.append((b, 'preview_signed_url', 'image_preview'))
             
