@@ -2189,7 +2189,11 @@ async def smart_content_lookup(
             region_task.cancel()
 
         best_result = winner
-    
+    except Exception as e:
+        # Garantir que qualquer exceção durante a fase adaptativa não quebre o handler
+        logging.exception(f"[smart-content][{request_id}] Erro durante lookups adaptativos: {e}")
+        best_result = None
+
     if not best_result:
         logging.warning("[smart-content] ❌ Nenhum conteudo encontrado")
         return {
