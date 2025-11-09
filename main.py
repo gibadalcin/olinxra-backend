@@ -44,7 +44,11 @@ client = None
 db = None
 logos_collection = None
 # Cache de geocoding em memória (otimização para evitar chamadas repetidas ao Nominatim)
+# Cache de geocoding em memória (otimização para evitar chamadas repetidas ao Nominatim)
 geocode_cache = {}
+# Cache simples de regiões (tupla: (nome_marca, tipo_regiao, nome_regiao) -> (ts, conteudo))
+region_cache = {}
+REGION_CACHE_TTL = 60 * 10  # 10 minutos
 # REMOVIDO: images_collection = None
 
 
@@ -107,6 +111,37 @@ async def uploaded_assets_cleanup_worker(db, stop_event: asyncio.Event, interval
             # timeout expired, loop again
             continue
 
+
+    async def populate_location_fields(db, batch_size: int = 500, sleep_between_batches: float = 0.5):
+        """
+        Background migration helper: procura documentos em `conteudos` que possuem
+        `latitude` e `longitude` mas não possuem o campo GeoJSON `location` e os
+        atualiza definindo `location: { type: 'Point', coordinates: [lon, lat] }`.
+
+        Executado em background no startup para preencher gradualmente os documentos
+        e permitir que consultas $geoNear utilizem o índice 2dsphere.
+        """
+        try:
+            logging.info('[migrate] populate_location_fields: iniciando background migration')
+            filter_query = {'location': {'$exists': False}, 'latitude': {'$exists': True}, 'longitude': {'$exists': True}}
+            while True:
+                cursor = db['conteudos'].find(filter_query, {'_id': 1, 'latitude': 1, 'longitude': 1}).limit(batch_size)
+                batch = await cursor.to_list(length=batch_size)
+                if not batch:
+                    logging.info('[migrate] populate_location_fields: nada a migrar, finalizando task')
+                    break
+                for doc in batch:
+                    try:
+                        lat = float(doc.get('latitude'))
+                        lon = float(doc.get('longitude'))
+                        await db['conteudos'].update_one({'_id': doc['_id']}, {'$set': {'location': {'type': 'Point', 'coordinates': [lon, lat]}}})
+                    except Exception:
+                        logging.exception('[migrate] Erro atualizando documento %s' % str(doc.get('_id')))
+                logging.info(f'[migrate] populate_location_fields: processados {len(batch)} documentos, aguardando {sleep_between_batches}s antes do próximo lote')
+                await asyncio.sleep(sleep_between_batches)
+        except Exception:
+            logging.exception('[migrate] Erro inesperado em populate_location_fields')
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, db, logos_collection
@@ -156,6 +191,14 @@ async def lifespan(app: FastAPI):
             logging.exception('Falha ao criar índice TTL para uploaded_assets')
 
         logging.info('Índices de conteúdo verificados/criados com sucesso.')
+        # Opcional: migration background para popular campo `location` a partir de latitude/longitude
+        run_migration = os.getenv('RUN_LOCATION_MIGRATION', 'false').lower() in ('1', 'true', 'yes')
+        if run_migration:
+            try:
+                asyncio.create_task(populate_location_fields(db))
+                logging.info('populate_location_fields agendado em background (RUN_LOCATION_MIGRATION=true)')
+            except Exception:
+                logging.exception('Falha ao agendar populate_location_fields')
     except Exception as e:
         logging.exception(f'Falha ao criar índices em conteudos: {e}')
     # REMOVIDO: images_collection = db["images"]
@@ -1759,8 +1802,20 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
         pass
 
     # Fallback: use bounding box deltas for lat/lon when radius not provided or geo query failed
-    lat_filter = {"$gte": latitude - 0.01, "$lte": latitude + 0.01}
-    lon_filter = {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
+    # Se radius_m for fornecido, convertemos metros->graus (aprox 1 deg ~= 111.32km) para reduzir o box
+    try:
+        if radius_m is not None and radius_m > 0:
+            deg = float(radius_m) / 111320.0
+            # adicionar 10% de margem
+            deg = max(deg * 1.1, 0.0001)
+            lat_filter = {"$gte": latitude - deg, "$lte": latitude + deg}
+            lon_filter = {"$gte": longitude - deg, "$lte": longitude + deg}
+        else:
+            lat_filter = {"$gte": latitude - 0.01, "$lte": latitude + 0.01}
+            lon_filter = {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
+    except Exception:
+        lat_filter = {"$gte": latitude - 0.01, "$lte": latitude + 0.01}
+        lon_filter = {"$gte": longitude - 0.01, "$lte": longitude + 0.01}
 
     # 1) Busca por marca_id — suportando tanto ObjectId quanto strings
     try:
@@ -2056,6 +2111,21 @@ async def smart_content_lookup(
             async def check_region(tipo_regiao, nome_regiao):
                 if not nome_regiao:
                     return None
+                cache_key = (nome_marca, tipo_regiao, nome_regiao)
+                # checar cache simples de região
+                try:
+                    entry = region_cache.get(cache_key)
+                    if entry:
+                        ts, cached_conteudo = entry
+                        if (time.time() - ts) < REGION_CACHE_TTL:
+                            logging.info(f"[smart-content][{request_id}] region_cache HIT {tipo_regiao}/{nome_regiao}")
+                            return ('region', f"{tipo_regiao}/{nome_regiao}", cached_conteudo)
+                        else:
+                            # expired
+                            region_cache.pop(cache_key, None)
+                except Exception:
+                    pass
+
                 start_r = time.perf_counter()
                 filtro = {"nome_marca": nome_marca, "tipo_regiao": tipo_regiao, "nome_regiao": nome_regiao}
                 conteudo = await db["conteudos"].find_one(filtro)
@@ -2064,6 +2134,12 @@ async def smart_content_lookup(
                 logging.info(f"[smart-content][{request_id}] region_check {tipo_regiao}/{nome_regiao} dur_ms={dur_r:.1f} hit={hit}")
                 if conteudo and conteudo.get("blocos"):
                     conteudo["_id"] = str(conteudo["_id"])
+                    # armazenar no cache (timestamp + conteudo)
+                    try:
+                        if len(region_cache) < 2000:
+                            region_cache[cache_key] = (time.time(), conteudo)
+                    except Exception:
+                        pass
                     logging.info(f"[smart-content][{request_id}] ✅ Encontrado em {tipo_regiao}/{nome_regiao}")
                     return ('region', f"{tipo_regiao}/{nome_regiao}", conteudo)
                 return None
