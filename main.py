@@ -824,8 +824,8 @@ async def _attach_signed_urls_core(
             except Exception:
                 continue
 
-        dur_total_ms = (t_after - t_before) * 1000.0
-        logging.info(f"[_attach_signed_urls_core] gather dur_ms={dur_total_ms:.1f} assigned_counts={counts}")
+    dur_total_ms = (t_after - t_before) * 1000.0
+    logging.debug(f"[_attach_signed_urls_core] gather dur_ms={dur_total_ms:.1f} assigned_counts={counts}")
 
     return blocos
 
@@ -1004,8 +1004,8 @@ async def attach_signed_urls_to_blocos_fast(blocos):
             except Exception:
                 continue
 
-        dur_total_ms = (t_after - t_before) * 1000.0
-        logging.info(f"[attach_signed_urls_fast_core] gather dur_ms={dur_total_ms:.1f} assigned_counts={counts}")
+    dur_total_ms = (t_after - t_before) * 1000.0
+    logging.debug(f"[attach_signed_urls_fast_core] gather dur_ms={dur_total_ms:.1f} assigned_counts={counts}")
     
     return blocos
 
@@ -1752,7 +1752,7 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
     # If radius_m is provided, try a geospatial $geoNear query first (more precise).
     # maxDistance for GeoJSON $near/$geoNear is in meters when using 2dsphere index.
     start = time.perf_counter()
-    logging.info(f"[buscar_conteudo] start marca_id={marca_id} lat={latitude} lon={longitude} radius_m={radius_m}")
+    logging.debug(f"[buscar_conteudo] start marca_id={marca_id} lat={latitude} lon={longitude} radius_m={radius_m}")
     try:
         if radius_m is not None and latitude is not None and longitude is not None:
             # If we have marca_id, prefer to search by marca_id, otherwise by nome_marca will be resolved below.
