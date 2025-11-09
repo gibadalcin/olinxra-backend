@@ -834,16 +834,14 @@ async def attach_signed_urls_to_blocos_fast(blocos):
                         elif it.get('meta') and isinstance(it['meta'].get('preview_filename'), str):
                             preview_fn = it['meta'].get('preview_filename')
 
-                        # Se não há preview explícita, derivar variantes comuns
-                        if not preview_fn and filename and isinstance(filename, str):
-                            name, dot, ext = filename.rpartition('.')
-                            base = name if name else filename
-                            # Tentar sufixos comuns: _t, _s, -thumb
-                            candidates = [f"{base}_t.{ext}" if ext else f"{base}_t",
-                                          f"{base}_s.{ext}" if ext else f"{base}_s",
-                                          f"{base}-thumb.{ext}" if ext else f"{base}-thumb"]
-                            # use first candidate that exists (we skip exists check for perf and will return None if not found)
-                            preview_fn = candidates[0]
+                        # IMPORTANTE: para manter o fast-path rápido, NÃO derivamos nomes de
+                        # preview a partir do filename aqui. Isso provocou várias tentativas
+                        # e checagens que aumentaram dramaticamente a latência.
+                        # Apenas use previews explicitamente fornecidos pelo uploader/DB
+                        # (preview_filename, thumb_filename, meta.preview_filename).
+                        # Se nenhum campo explícito existir, não tentamos gerar preview.
+                        if not preview_fn:
+                            preview_fn = None
 
                         if preview_fn:
                             # If original url was a gs:// form, try to turn into gs://.../preview_fn
@@ -900,10 +898,11 @@ async def attach_signed_urls_to_blocos_fast(blocos):
             elif b.get('meta') and isinstance(b['meta'].get('preview_filename'), str):
                 preview_fn = b['meta'].get('preview_filename')
 
-            if not preview_fn and filename and isinstance(filename, str):
-                name, dot, ext = filename.rpartition('.')
-                base = name if name else filename
-                preview_fn = f"{base}_t.{ext}" if ext else f"{base}_t"
+                # Não derivar preview a partir do filename no fast-path.
+                # Somente previews explícitos (preview_filename/thumb_filename/meta.preview_filename)
+                # serão considerados para anexar preview_signed_url.
+                if not preview_fn:
+                    preview_fn = None
 
             if preview_fn:
                 preview_gs = None
