@@ -765,15 +765,24 @@ async def _attach_signed_urls_core(
 
     # Executar em paralelo
     if tasks:
+        t_before = time.perf_counter()
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        t_after = time.perf_counter()
+
+        # Aplicar resultados e contabilizar tipos atribuídos
+        counts = {}
         for (target, field, tipo), result in zip(task_metadata, results):
             try:
                 if isinstance(result, Exception):
                     continue
                 if result:
                     target[field] = result
+                    counts[field] = counts.get(field, 0) + 1
             except Exception:
                 continue
+
+        dur_total_ms = (t_after - t_before) * 1000.0
+        logging.info(f"[_attach_signed_urls_core] gather dur_ms={dur_total_ms:.1f} assigned_counts={counts}")
 
     return blocos
 
@@ -937,15 +946,23 @@ async def attach_signed_urls_to_blocos_fast(blocos):
     
     # Executar em paralelo
     if tasks:
+        t_before = time.perf_counter()
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        t_after = time.perf_counter()
+
+        counts = {}
         for (target, field, tipo), result in zip(task_metadata, results):
             try:
                 if isinstance(result, Exception):
                     continue
                 if result:
                     target[field] = result
+                    counts[field] = counts.get(field, 0) + 1
             except Exception:
                 continue
+
+        dur_total_ms = (t_after - t_before) * 1000.0
+        logging.info(f"[attach_signed_urls_fast_core] gather dur_ms={dur_total_ms:.1f} assigned_counts={counts}")
     
     return blocos
 
@@ -1694,6 +1711,8 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
     """
     # If radius_m is provided, try a geospatial $geoNear query first (more precise).
     # maxDistance for GeoJSON $near/$geoNear is in meters when using 2dsphere index.
+    start = time.perf_counter()
+    logging.info(f"[buscar_conteudo] start marca_id={marca_id} lat={latitude} lon={longitude} radius_m={radius_m}")
     try:
         if radius_m is not None and latitude is not None and longitude is not None:
             # If we have marca_id, prefer to search by marca_id, otherwise by nome_marca will be resolved below.
@@ -1728,6 +1747,8 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
                         d0['_distance_m'] = float(d0.get('dist', {}).get('calculated', 0))
                     except Exception:
                         d0['_distance_m'] = None
+                    dur = (time.perf_counter() - start) * 1000.0
+                    logging.info(f"[buscar_conteudo] geoNear hit dur_ms={dur:.1f}")
                     return d0
             except Exception:
                 # if geo query fails, fall back to bounding box approach below
@@ -1759,6 +1780,8 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
 
         doc = await db["conteudos"].find_one(filtro)
         if doc:
+            dur = (time.perf_counter() - start) * 1000.0
+            logging.info(f"[buscar_conteudo] match by marca_id dur_ms={dur:.1f}")
             return doc
     except Exception:
         # falha ao buscar por marca_id — seguimos com fallbacks
@@ -1787,6 +1810,8 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
         }
         doc = await db["conteudos"].find_one(filtro2)
         if doc:
+            dur = (time.perf_counter() - start) * 1000.0
+            logging.info(f"[buscar_conteudo] match by nome_marca dur_ms={dur:.1f}")
             return doc
 
     # 3) Fallback: busca por nome_marca igual ao valor recebido
@@ -1795,7 +1820,10 @@ async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude,
         "latitude": lat_filter,
         "longitude": lon_filter
     }
-    return await db["conteudos"].find_one(filtro3)
+    result = await db["conteudos"].find_one(filtro3)
+    dur = (time.perf_counter() - start) * 1000.0
+    logging.info(f"[buscar_conteudo] fallback result dur_ms={dur:.1f}")
+    return result
 
 async def geocode_reverse(lat, lon):
     url = "https://nominatim.openstreetmap.org/reverse"
@@ -1999,12 +2027,15 @@ async def smart_content_lookup(
     # 3. Preparar todas as estratégias de busca em paralelo
     async def try_proximity(radius_m: float):
         """Tenta buscar por proximidade com raio específico"""
+        start_p = time.perf_counter()
         try:
             result = await buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude, radius_m)
+            dur = (time.perf_counter() - start_p) * 1000.0
+            logging.info(f"[smart-content][{request_id}] proximity {radius_m}m dur_ms={dur:.1f} hit={bool(result and result.get('blocos'))}")
             if result and result.get('blocos'):
                 return ('proximity', radius_m, result)
         except Exception as e:
-            logging.debug(f"[smart-content] Proximity {radius_m}m falhou: {e}")
+            logging.debug(f"[smart-content][{request_id}] Proximity {radius_m}m falhou: {e}")
         return None
     
     async def try_region_lookup():
@@ -2025,11 +2056,15 @@ async def smart_content_lookup(
             async def check_region(tipo_regiao, nome_regiao):
                 if not nome_regiao:
                     return None
+                start_r = time.perf_counter()
                 filtro = {"nome_marca": nome_marca, "tipo_regiao": tipo_regiao, "nome_regiao": nome_regiao}
                 conteudo = await db["conteudos"].find_one(filtro)
+                dur_r = (time.perf_counter() - start_r) * 1000.0
+                hit = bool(conteudo and conteudo.get("blocos"))
+                logging.info(f"[smart-content][{request_id}] region_check {tipo_regiao}/{nome_regiao} dur_ms={dur_r:.1f} hit={hit}")
                 if conteudo and conteudo.get("blocos"):
                     conteudo["_id"] = str(conteudo["_id"])
-                    logging.info(f"[smart-content] ✅ Encontrado em {tipo_regiao}/{nome_regiao}")
+                    logging.info(f"[smart-content][{request_id}] ✅ Encontrado em {tipo_regiao}/{nome_regiao}")
                     return ('region', f"{tipo_regiao}/{nome_regiao}", conteudo)
                 return None
             
