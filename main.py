@@ -601,23 +601,36 @@ async def verify_firebase_token_dep(credentials: HTTPAuthorizationCredentials = 
 
 
 async def attach_signed_urls_to_blocos(blocos):
-    """Given a list of blocos, attach a 'signed_url' field for media blocos.
-    This runs gerar_signed_url_conteudo in a thread to avoid blocking the event loop.
-    
-    IMPORTANTE: Esta função é usada pelos endpoints PÚBLICOS (/api/conteudo, /api/conteudo-por-regiao)
-    que o app mobile usa SEM autenticação. Por isso, gera signed URLs para:
-    - Imagens originais (signed_url)
-    - GLBs pré-gerados (glb_signed_url)
-    
-    ⚡ OTIMIZADO: Gera todas as signed URLs em PARALELO usando asyncio.gather()
+    # Delegar para a implementação central com expirações padrão e checagem de existência
+    return await _attach_signed_urls_core(
+        blocos,
+        expiration_image=3600,
+        expiration_glb=7*24*60*60,
+        skip_exists_check=False,
+        include_preview=False
+    )
+
+
+async def _attach_signed_urls_core(
+    blocos,
+    *,
+    expiration_image: int = 3600,
+    expiration_glb: int = 7 * 24 * 60 * 60,
+    skip_exists_check: bool = False,
+    include_preview: bool = False,
+):
+    """Implementação central para anexar signed URLs aos blocos.
+
+    Os parâmetros permitem controlar os tempos de expiração, optar por pular a
+    verificação de existência dos objetos (caminho rápido) e indicar se deve
+    tentar anexar um `preview_signed_url` (thumbnail).
     """
     if not blocos or not isinstance(blocos, list):
         return blocos
-    
-    # Coletar todas as tarefas de geração de signed URL
+
     tasks = []
-    task_metadata = []  # (bloco_ou_item, campo, tipo)
-    
+    task_metadata = []
+
     for b in blocos:
         try:
             tipo_selecionado = b.get('tipoSelecionado') or ''
@@ -631,8 +644,8 @@ async def attach_signed_urls_to_blocos(blocos):
                     is_media = True
             if not is_media:
                 continue
-            
-            # For carousel, process items
+
+            # Carousel items
             if b.get('items') and isinstance(b.get('items'), list):
                 for it in b['items']:
                     # URL da imagem
@@ -641,49 +654,126 @@ async def attach_signed_urls_to_blocos(blocos):
                     if not url and filename:
                         url = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
                     if url:
-                        tasks.append(asyncio.to_thread(gerar_signed_url_conteudo, url, filename))
+                        tasks.append(asyncio.to_thread(
+                            gerar_signed_url_conteudo, url, filename,
+                            expiration=expiration_image, skip_exists_check=skip_exists_check
+                        ))
                         task_metadata.append((it, 'signed_url', 'image'))
-                    
+
+                        # Preview (optional)
+                        if include_preview:
+                            preview_fn = None
+                            if isinstance(it.get('preview_filename'), str):
+                                preview_fn = it.get('preview_filename')
+                            elif isinstance(it.get('thumb_filename'), str):
+                                preview_fn = it.get('thumb_filename')
+                            elif it.get('meta') and isinstance(it['meta'].get('preview_filename'), str):
+                                preview_fn = it['meta'].get('preview_filename')
+
+                            if not preview_fn and filename and isinstance(filename, str):
+                                name, dot, ext = filename.rpartition('.')
+                                base = name if name else filename
+                                candidates = [f"{base}_t.{ext}" if ext else f"{base}_t",
+                                              f"{base}_s.{ext}" if ext else f"{base}_s",
+                                              f"{base}-thumb.{ext}" if ext else f"{base}-thumb"]
+                                preview_fn = candidates[0]
+
+                            if preview_fn:
+                                preview_gs = None
+                                if url and isinstance(url, str) and url.startswith('gs://'):
+                                    parts = url.split('/')
+                                    if len(parts) >= 4:
+                                        preview_gs = '/'.join(parts[:3] + [preview_fn])
+                                    else:
+                                        preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+                                else:
+                                    preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+
+                                tasks.append(asyncio.to_thread(
+                                    gerar_signed_url_conteudo, preview_gs, preview_fn,
+                                    expiration=expiration_image, skip_exists_check=skip_exists_check
+                                ))
+                                task_metadata.append((it, 'preview_signed_url', 'image_preview'))
+
                     # URL do GLB
                     glb_url = it.get('glb_url')
                     glb_filename = it.get('glb_filename')
                     if glb_url:
-                        tasks.append(asyncio.to_thread(gerar_signed_url_conteudo, glb_url, glb_filename, 7*24*60*60))
+                        tasks.append(asyncio.to_thread(
+                            gerar_signed_url_conteudo, glb_url, glb_filename,
+                            expiration=expiration_glb, skip_exists_check=skip_exists_check
+                        ))
                         task_metadata.append((it, 'glb_signed_url', 'glb'))
                 continue
-            
-            # Single media block - URL da imagem
+
+            # Single media block - imagem
             url = b.get('url')
             filename = b.get('filename')
             if not url and filename:
                 url = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
             if url:
-                tasks.append(asyncio.to_thread(gerar_signed_url_conteudo, url, filename))
+                tasks.append(asyncio.to_thread(
+                    gerar_signed_url_conteudo, url, filename,
+                    expiration=expiration_image, skip_exists_check=skip_exists_check
+                ))
                 task_metadata.append((b, 'signed_url', 'image'))
-            
-            # Single media block - URL do GLB
+
+            # Preview for single media block (optional)
+            if include_preview:
+                preview_fn = None
+                if isinstance(b.get('preview_filename'), str):
+                    preview_fn = b.get('preview_filename')
+                elif isinstance(b.get('thumb_filename'), str):
+                    preview_fn = b.get('thumb_filename')
+                elif b.get('meta') and isinstance(b['meta'].get('preview_filename'), str):
+                    preview_fn = b['meta'].get('preview_filename')
+
+                if not preview_fn and filename and isinstance(filename, str):
+                    name, dot, ext = filename.rpartition('.')
+                    base = name if name else filename
+                    preview_fn = f"{base}_t.{ext}" if ext else f"{base}_t"
+
+                if preview_fn:
+                    preview_gs = None
+                    if url and isinstance(url, str) and url.startswith('gs://'):
+                        parts = url.split('/')
+                        if len(parts) >= 4:
+                            preview_gs = '/'.join(parts[:3] + [preview_fn])
+                        else:
+                            preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+                    else:
+                        preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
+
+                    tasks.append(asyncio.to_thread(
+                        gerar_signed_url_conteudo, preview_gs, preview_fn,
+                        expiration=expiration_image, skip_exists_check=skip_exists_check
+                    ))
+                    task_metadata.append((b, 'preview_signed_url', 'image_preview'))
+
+            # Single media block - GLB
             glb_url = b.get('glb_url')
             glb_filename = b.get('glb_filename')
             if glb_url:
-                tasks.append(asyncio.to_thread(gerar_signed_url_conteudo, glb_url, glb_filename, 7*24*60*60))
+                tasks.append(asyncio.to_thread(
+                    gerar_signed_url_conteudo, glb_url, glb_filename,
+                    expiration=expiration_glb, skip_exists_check=skip_exists_check
+                ))
                 task_metadata.append((b, 'glb_signed_url', 'glb'))
         except Exception:
             continue
-    
-    # ⚡ EXECUTAR TODAS AS TAREFAS EM PARALELO
+
+    # Executar em paralelo
     if tasks:
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Atribuir resultados de volta aos blocos/items
         for (target, field, tipo), result in zip(task_metadata, results):
             try:
                 if isinstance(result, Exception):
-                    continue  # Ignorar erros
+                    continue
                 if result:
                     target[field] = result
             except Exception:
                 continue
-    
+
     return blocos
 
 
