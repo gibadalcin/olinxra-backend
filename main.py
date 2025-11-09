@@ -2081,29 +2081,114 @@ async def smart_content_lookup(
             logging.debug(f"[smart-content] Region lookup falhou: {e}")
         return None
     
-    # 4. Executar TODAS as estratégias EM PARALELO
-    logging.info(f"[smart-content][{request_id}] Executando lookups em paralelo...")
-    tasks = [
-        try_proximity(50),
-        try_proximity(200),
-        try_proximity(1000),
-        try_proximity(5000),
-        try_region_lookup()
-    ]
-    
-    # Executar em paralelo e pegar o primeiro resultado
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    t_after_lookups = time.perf_counter()
-    logging.info(
-        f"[smart-content][{request_id}] lookups completed; results={[r is not None and not isinstance(r, Exception) for r in results]} dur_ms={(t_after_lookups-t_after_fetch)*1000:.1f} total_ms={(t_after_lookups-t0)*1000:.1f}"
-    )
-    
-    # 5. Encontrar primeiro resultado válido
-    best_result = None
-    for idx, result in enumerate(results):
-        if result and not isinstance(result, Exception):
-            best_result = result
-            break
+    # 4. Estratégia adaptativa: priorizar region ou proximity dependendo da granularidade
+    logging.info(f"[smart-content][{request_id}] Executando lookups em modo adaptativo...")
+
+    # preparar tasks (criar tasks para permitir cancelamento)
+    proximity_radii = [50, 200, 1000, 5000]
+    proximity_tasks = [asyncio.create_task(try_proximity(r)) for r in proximity_radii]
+    region_task = asyncio.create_task(try_region_lookup()) if geocode_data else None
+
+    # deduzir granularidade a partir do geocode
+    granularity = 'unknown'
+    if geocode_data:
+        if geocode_data.get('road') or geocode_data.get('suburb') or geocode_data.get('neighbourhood'):
+            granularity = 'street'
+        elif geocode_data.get('city'):
+            granularity = 'city'
+        elif geocode_data.get('state'):
+            granularity = 'state'
+
+    try:
+        winner = None
+
+        # Caso city/state: tentar region primeiro com um timeout curto; se não, esperar por first completed entre region+proximities
+        if granularity in ('city', 'state') and region_task is not None:
+            # aguardar region por até 0.45s — se bater, usamos imediatamente
+            done, pending = await asyncio.wait([region_task], timeout=0.45, return_when=asyncio.FIRST_COMPLETED)
+            if region_task in done:
+                try:
+                    res = region_task.result()
+                    if res:
+                        winner = res
+                except Exception:
+                    pass
+            if winner is None:
+                # aguardar o primeiro completed entre proximal + region
+                all_tasks = [t for t in proximity_tasks]
+                if region_task:
+                    all_tasks.append(region_task)
+                done, pending = await asyncio.wait(all_tasks, timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+                # verificar resultados em 'done'
+                for d in done:
+                    try:
+                        r = d.result()
+                        if r:
+                            winner = r
+                            break
+                    except Exception:
+                        continue
+
+        # Caso street (road/suburb) ou quando há um radius implícito: tentar proximity primeiro
+        elif granularity == 'street':
+            # esperar proximities por até 1.5s
+            done, pending = await asyncio.wait(proximity_tasks, timeout=1.5, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                try:
+                    r = d.result()
+                    if r:
+                        winner = r
+                        break
+                except Exception:
+                    continue
+            if winner is None and region_task is not None:
+                # tentar region como fallback rápido
+                try:
+                    res = await asyncio.wait_for(region_task, timeout=0.5)
+                    # region_task returns a tuple when hit, else None
+                    if isinstance(res, tuple) and res:
+                        winner = res
+                except Exception:
+                    pass
+
+        # Caso desconhecido: aguardar o primeiro que terminar entre todos
+        else:
+            all_tasks = [t for t in proximity_tasks]
+            if region_task:
+                all_tasks.append(region_task)
+            done, pending = await asyncio.wait(all_tasks, timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                try:
+                    r = d.result()
+                    if r:
+                        winner = r
+                        break
+                except Exception:
+                    continue
+
+        # Se ainda sem vencedor, aguardar todos e escolher o primeiro válido (safe fallback)
+        if winner is None:
+            # coletar resultados finais
+            final_tasks = [t for t in proximity_tasks]
+            if region_task:
+                final_tasks.append(region_task)
+            try:
+                results = await asyncio.gather(*final_tasks, return_exceptions=True)
+                for r in results:
+                    if r and not isinstance(r, Exception):
+                        winner = r
+                        break
+            except Exception:
+                pass
+
+        # cancelar tasks pendentes para evitar trabalho desnecessário
+        for t in proximity_tasks:
+            if not t.done():
+                t.cancel()
+        if region_task and not region_task.done():
+            region_task.cancel()
+
+        best_result = winner
     
     if not best_result:
         logging.warning("[smart-content] ❌ Nenhum conteudo encontrado")
