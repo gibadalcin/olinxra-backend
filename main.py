@@ -1051,9 +1051,6 @@ async def _search_and_compare_logic(file: UploadFile):
         # heavy CPU work: run in threadpool to avoid blocking event loop
         query_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
         import numpy as np
-        print("query_vector shape:", np.array(query_vector).shape)
-        print("query_vector values:", np.array(query_vector).tolist())
-        print("faiss index dimension:", logo_index.index.d)
         results = logo_index.search(query_vector, top_k=1)
 
         if results:
@@ -1681,7 +1678,7 @@ async def list_users(token: dict = Depends(verify_firebase_token_dep)):
             users.append({"uid": user.uid, "email": user.email})
         return users
     except Exception as e:
-        print("Erro ao listar usuários:", e)
+        logging.exception("Erro ao listar usuários: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/create")
