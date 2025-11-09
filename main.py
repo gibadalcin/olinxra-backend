@@ -27,6 +27,7 @@ from clip_utils import extract_clip_features
 from faiss_index import LogoIndex
 from email.mime.text import MIMEText
 import asyncio
+import time
 import onnxruntime as ort
 from PIL import Image as PILImage
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -1939,7 +1940,10 @@ async def smart_content_lookup(
     Reduz tempo de ~20s para ~2-3s quando o conteúdo está em região (caso G3).
     """
     
-    logging.info(f"[smart-content] Buscando conteudo para marca={nome_marca}, lat={latitude}, lon={longitude}")
+    request_id = str(uuid.uuid4())
+    t0 = time.perf_counter()
+    ts0 = datetime.utcnow().isoformat()
+    logging.info(f"[smart-content][{request_id}] Buscando conteudo para marca={nome_marca}, lat={latitude}, lon={longitude} ts={ts0}")
     
     # 1. Buscar marca E fazer geocode EM PARALELO (otimização: -0.5s)
     async def fetch_marca():
@@ -1981,6 +1985,10 @@ async def smart_content_lookup(
     
     # Executar marca + geocode em paralelo
     marca, geocode_data = await asyncio.gather(fetch_marca(), fetch_geocode())
+    t_after_fetch = time.perf_counter()
+    logging.info(
+        f"[smart-content][{request_id}] fetch completed; marca_found={bool(marca)} geocode_cached={bool(geocode_data)} dur_ms={(t_after_fetch-t0)*1000:.1f}"
+    )
     
     if not marca:
         return {"conteudo": None, "mensagem": "Marca não encontrada."}
@@ -2039,7 +2047,7 @@ async def smart_content_lookup(
         return None
     
     # 4. Executar TODAS as estratégias EM PARALELO
-    logging.info("[smart-content] Executando lookups em paralelo...")
+    logging.info(f"[smart-content][{request_id}] Executando lookups em paralelo...")
     tasks = [
         try_proximity(50),
         try_proximity(200),
@@ -2050,7 +2058,10 @@ async def smart_content_lookup(
     
     # Executar em paralelo e pegar o primeiro resultado
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info(f"[smart-content] Resultados: {[r is not None and not isinstance(r, Exception) for r in results]}")
+    t_after_lookups = time.perf_counter()
+    logging.info(
+        f"[smart-content][{request_id}] lookups completed; results={[r is not None and not isinstance(r, Exception) for r in results]} dur_ms={(t_after_lookups-t_after_fetch)*1000:.1f} total_ms={(t_after_lookups-t0)*1000:.1f}"
+    )
     
     # 5. Encontrar primeiro resultado válido
     best_result = None
@@ -2072,7 +2083,15 @@ async def smart_content_lookup(
     blocos_doc = conteudo.get('blocos', [])
     
     # ⚡ Gerar signed URLs com versão OTIMIZADA (skip_exists_check + TTL 7 dias)
-    await attach_signed_urls_to_blocos_fast(blocos_doc)
+    t_before_attach = time.perf_counter()
+    try:
+        await attach_signed_urls_to_blocos_fast(blocos_doc)
+    except Exception as e:
+        logging.exception(f"[smart-content][{request_id}] Erro ao anexar signed_urls: {e}")
+    t_after_attach = time.perf_counter()
+    logging.info(
+        f"[smart-content][{request_id}] attach_signed_urls done; dur_ms={(t_after_attach-t_before_attach)*1000:.1f} total_ms={(t_after_attach-t0)*1000:.1f} blocks={len(blocos_doc)} strategy={strategy} detail={detail}"
+    )
     
     # 7. Montar resposta
     resultado = {
@@ -2084,7 +2103,7 @@ async def smart_content_lookup(
         "matched_detail": detail
     }
     
-    logging.info(f"[smart-content] 🎯 Retornando conteudo com {len(blocos_doc)} blocos")
+    logging.info(f"[smart-content][{request_id}] 🎯 Retornando conteudo com {len(blocos_doc)} blocos")
     if conteudo.get('radius_m') is not None:
         resultado['radius_m'] = conteudo.get('radius_m')
     
