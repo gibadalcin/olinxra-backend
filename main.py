@@ -1645,27 +1645,74 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
 
 @app.delete('/delete-logo/')
 async def delete_logo(id: str = Query(...), token: dict = Depends(verify_firebase_token_dep)):
+    # Tentativa tolerante de resolver o registro da logo.
+    # 1) Se for um ObjectId válido, usa isso
+    # 2) Caso contrário, tenta encontrar por string do _id, filename ou nome
+    logo = None
+    object_id = None
     try:
         object_id = ObjectId(id)
-    except (InvalidId, TypeError):
-        raise HTTPException(status_code=400, detail="ID inválido")
-    logo = await logos_collection.find_one({"_id": object_id})
+    except Exception:
+        object_id = None
+
+    if object_id:
+        logo = await logos_collection.find_one({"_id": object_id})
+    else:
+        # procurar por _id como string (compatibilidade) OU por filename OU por nome
+        try:
+            logo = await logos_collection.find_one({
+                "$or": [
+                    {"_id": id},
+                    {"filename": id},
+                    {"nome": id}
+                ]
+            })
+        except Exception:
+            # busca mais segura: percorrer e comparar manualmente (fallback)
+            cursor = logos_collection.find({})
+            async for doc in cursor:
+                try:
+                    if str(doc.get('_id')) == str(id) or doc.get('filename') == id or doc.get('nome') == id:
+                        logo = doc
+                        break
+                except Exception:
+                    continue
+
     if not logo:
         raise HTTPException(status_code=404, detail="Imagem não encontrada")
-    from gcs_utils import get_bucket
-    bucket = get_bucket("logos")
-    blob = bucket.blob(logo['filename'])
+
+    # Tenta deletar o arquivo no GCS de forma tolerante/idempotente
+    from gcs_utils import delete_gs_path, delete_file
+
+    deleted_ok = False
+    # Preferir deletar via gs_url se disponível
     try:
-        blob.delete()
-    except Exception as e:
-        from google.api_core.exceptions import NotFound
-        if isinstance(e, NotFound):
-            # Arquivo já não existe, segue normalmente
-            pass
+        if logo.get('url') and isinstance(logo.get('url'), str) and logo.get('url').startswith('gs://'):
+            deleted_ok = await asyncio.to_thread(delete_gs_path, logo.get('url'))
+        elif logo.get('filename'):
+            # delete_file aceita tanto 'path/filename' quanto 'gs://...' indireto
+            deleted_ok = await asyncio.to_thread(delete_file, logo.get('filename'), 'logos')
         else:
-            raise HTTPException(status_code=500, detail=f"Erro ao deletar arquivo do bucket: {str(e)}")
-    await logos_collection.delete_one({"_id": object_id})
-    return {"success": True}
+            # fallback: nothing to delete in storage, consider deleted
+            deleted_ok = True
+    except Exception as e:
+        logging.exception(f"Erro ao deletar arquivo do GCS para logo {logo.get('_id')}: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao deletar arquivo do bucket: {str(e)}")
+
+    # Agora remove o documento do banco
+    try:
+        # use _id se disponível no documento recuperado
+        doc_id = logo.get('_id')
+        if doc_id:
+            await logos_collection.delete_one({'_id': doc_id})
+        else:
+            # fallback: tentar deletar por filename/nome
+            await logos_collection.delete_one({'filename': logo.get('filename')})
+    except Exception as e:
+        logging.exception(f"Erro ao deletar documento de logo no MongoDB: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao remover registro no banco: {str(e)}")
+
+    return {"success": True, "deleted_gcs": bool(deleted_ok), "id": str(logo.get('_id')), "filename": logo.get('filename')}
 
 @app.get("/admin/list")
 async def list_users(token: dict = Depends(verify_firebase_token_dep)):
