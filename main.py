@@ -1249,11 +1249,13 @@ async def _search_and_compare_logic(file: UploadFile):
                 var_ratio_min=adaptive_var_ratio,
                 min_area_ratio=adaptive_min_area
             )
-
+            # track which crop method was used so we can expose it in the response
+            crop_method = None
             if bbox:
                 left, top, right, bottom = bbox
                 logging.info(f"[search_logo] adaptive crop used bbox={bbox}")
                 center_crop = img.crop((left, top, right, bottom))
+                crop_method = 'adaptive'
             else:
                 # Adaptive crop falhou (retornou None) — registrar parâmetros para diagnóstico
                 logging.info(f"[search_logo] adaptive crop returned None (seed={adaptive_seed_ratio}, step={adaptive_step_ratio}, max_expand={adaptive_max_expand}, edge_th={adaptive_edge_th}, var_ratio_min={adaptive_var_ratio}, min_area={adaptive_min_area}) — fallback to fixed center-crop")
@@ -1271,6 +1273,7 @@ async def _search_and_compare_logic(file: UploadFile):
                 right = left + crop_side
                 bottom = top + crop_side
                 center_crop = img.crop((left, top, right, bottom))
+                crop_method = 'center_fallback'
                 logging.info(f"[search_logo] fallback center-crop bbox={(left, top, right, bottom)} crop_side={crop_side} vshift_pixels={vshift_pixels}")
 
             center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
@@ -1590,6 +1593,12 @@ async def _search_and_compare_logic(file: UploadFile):
                         os.remove(center_path)
                 except Exception:
                     pass
+                # annotate response with crop method for debugging/observability
+                try:
+                    if isinstance(res_center, dict):
+                        res_center['crop_used'] = crop_method or 'center'
+                except Exception:
+                    pass
                 return res_center
 
             # Se crop não aceitou, tentar com a imagem completa
@@ -1614,6 +1623,18 @@ async def _search_and_compare_logic(file: UploadFile):
                 except Exception:
                     pass
                 # preferir resultado da full se aceitou, senão retornar res_center (mais conservador)
+                # annotate responses with crop method
+                try:
+                    if isinstance(res_full, dict):
+                        res_full['crop_used'] = 'full_image'
+                except Exception:
+                    pass
+                try:
+                    if isinstance(res_center, dict):
+                        res_center['crop_used'] = crop_method or 'center'
+                except Exception:
+                    pass
+
                 if res_full.get('found'):
                     return res_full
                 return res_center
@@ -1626,6 +1647,11 @@ async def _search_and_compare_logic(file: UploadFile):
             return {"found": False, "trusted": False, "debug": "Erro ao extrair embedding", "debug_reason": "extract_failed", "query_vector": None}
 
         res_full = await _search_and_filter(full_vector, temp_path)
+        try:
+            if isinstance(res_full, dict):
+                res_full['crop_used'] = 'full_image'
+        except Exception:
+            pass
         return res_full
     finally:
         if temp_path and os.path.exists(temp_path):
