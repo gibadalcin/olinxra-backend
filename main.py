@@ -30,6 +30,19 @@ import asyncio
 import time
 import onnxruntime as ort
 from PIL import Image as PILImage
+# preprocessing helper (opt-in) for logo crops
+try:
+    from tools.preprocess_variants import preprocess_crop
+except Exception:
+    # If import fails, define a noop fallback to avoid startup break
+    def preprocess_crop(img, bbox=None, expand_pct=0.0, mode='none'):
+        try:
+            if bbox:
+                left, top, right, bottom = bbox
+                return img.crop((left, top, right, bottom)).convert('RGB')
+        except Exception:
+            pass
+        return img.convert('RGB')
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 
@@ -1275,6 +1288,28 @@ async def _search_and_compare_logic(file: UploadFile):
                 center_crop = img.crop((left, top, right, bottom))
                 crop_method = 'center_fallback'
                 logging.info(f"[search_logo] fallback center-crop bbox={(left, top, right, bottom)} crop_side={crop_side} vshift_pixels={vshift_pixels}")
+
+            # Optional preprocessing & bbox expansion controlled via ENV
+            try:
+                preprocess_mode = os.getenv('SEARCH_PREPROCESS_MODE', 'none').lower()
+                try:
+                    expand_pct = float(os.getenv('SEARCH_CROP_EXPAND_PCT', '0')) / 100.0
+                except Exception:
+                    expand_pct = 0.0
+                # If preprocess_mode is 'none' and expand_pct == 0, keep original center_crop
+                if (preprocess_mode and preprocess_mode != 'none') or expand_pct > 0.0:
+                    try:
+                        # Reuse bbox if available to expand; otherwise pass None to operate on full image
+                        used_bbox = (left, top, right, bottom) if bbox else None
+                        proc = preprocess_crop(img, bbox=used_bbox, expand_pct=expand_pct, mode=preprocess_mode)
+                        center_crop = proc
+                        logging.info(f"[search_logo] applied preprocess mode={preprocess_mode} expand_pct={expand_pct*100:.1f}% to crop")
+                    except Exception:
+                        logging.exception('[search_logo] falha ao aplicar preprocess (continuando com crop original)')
+
+            except Exception:
+                # env parse errors - ignore and continue
+                pass
 
             center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
             center_path = center_tmp.name
