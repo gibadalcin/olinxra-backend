@@ -1362,28 +1362,13 @@ async def upload_cancel(
         await db['uploaded_assets'].delete_one({'_id': asset['_id']})
         return {'ok': True, 'deleted': True}
     except HTTPException:
-            try:
-                img = PILImage.open(temp_path).convert('RGB')
-                w, h = img.size
-                side = min(w, h)
-                crop_side = int(side * crop_ratio)
-                # horizontal center
-                left = max(0, int((w - crop_side) // 2))
-                # vertical center with optional upward bias to avoid captions below logos
-                extra_v = max(0, h - crop_side)
-                center_top = int(extra_v // 2)
-                # shift upwards by a fraction of the extra vertical space
-                top = max(0, int(center_top - crop_vshift * extra_v))
-                right = left + crop_side
-                bottom = top + crop_side
-                center_crop = img.crop((left, top, right, bottom))
-                center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                center_path = center_tmp.name
-                center_crop.save(center_path, format='JPEG', quality=90)
-            except Exception:
-                logging.exception('[search_logo] falha ao gerar crop central; prosseguindo com imagem full')
-                center_path = None
-        orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
+        # Se a função chamou explicitamente HTTPException, propagar
+        raise
+    except Exception:
+        logging.exception('[upload_cancel] erro inesperado')
+        raise HTTPException(status_code=500, detail='internal error')
+
+    orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
         from gcs_utils import delete_gs_path
         for a in orphans:
             try:
