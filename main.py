@@ -315,6 +315,143 @@ def resize_image_if_needed(src_path: str, max_dim: int = 2048) -> str:
     return src_path
 
 
+def adaptive_center_out_crop_pil(img: PILImage.Image,
+                                 seed_ratio: float = 0.20,
+                                 step_ratio: float = 0.05,
+                                 max_expand_ratio: float = 0.5,
+                                 edge_th: float = 0.01,
+                                 var_ratio_min: float = 0.4,
+                                 min_area_ratio: float = 0.01):
+    """
+    Heurística leve para encontrar a região do logo partindo do centro e
+    expandindo até as extremidades onde o conteúdo cai.
+
+    Retorna bbox (left, top, right, bottom) em coordenadas inteiras ou None
+    se não for possível encontrar uma região significativa.
+    """
+    try:
+        w, h = img.size
+        side = min(w, h)
+        seed_side = max(4, int(seed_ratio * side))
+        cx, cy = w // 2, h // 2
+        half = seed_side // 2
+        left = max(0, cx - half)
+        right = min(w, cx + half)
+        top = max(0, cy - half)
+        bottom = min(h, cy + half)
+
+        # grayscale normalized
+        g = np.array(img.convert('L'), dtype=np.float32) / 255.0
+
+        def band_stats(band):
+            if band.size == 0:
+                return 0.0, 0.0
+            var = float(np.var(band))
+            gx, gy = np.gradient(band)
+            mag = np.hypot(gx, gy)
+            edge_density = float(np.mean(mag > edge_th))
+            return var, edge_density
+
+        seed = g[top:bottom, left:right]
+        if seed.size == 0:
+            return None
+        seed_var, seed_edge = band_stats(seed)
+
+        step_px = max(1, int(step_ratio * side))
+        max_expand_px = int(max_expand_ratio * side)
+
+        # track how many pixels expanded from seed on each side
+        expanded_left = expanded_right = expanded_top = expanded_bottom = 0
+        stop_left = stop_right = stop_top = stop_bottom = False
+
+        # max iterations to avoid infinite loops
+        max_iters = int(max_expand_px / max(1, step_px)) + 2
+
+        for _ in range(max_iters):
+            made_progress = False
+
+            # LEFT
+            if not stop_left:
+                new_left = max(0, left - step_px)
+                if new_left >= left:
+                    stop_left = True
+                else:
+                    band = g[top:bottom, new_left:left]
+                    var, edge = band_stats(band)
+                    if edge >= edge_th or var >= seed_var * var_ratio_min:
+                        left = new_left
+                        expanded_left += (left - new_left)
+                        made_progress = True
+                    else:
+                        stop_left = True
+
+            # RIGHT
+            if not stop_right:
+                new_right = min(w, right + step_px)
+                if new_right <= right:
+                    stop_right = True
+                else:
+                    band = g[top:bottom, right:new_right]
+                    var, edge = band_stats(band)
+                    if edge >= edge_th or var >= seed_var * var_ratio_min:
+                        right = new_right
+                        expanded_right += (new_right - right)
+                        made_progress = True
+                    else:
+                        stop_right = True
+
+            # TOP
+            if not stop_top:
+                new_top = max(0, top - step_px)
+                if new_top >= top:
+                    stop_top = True
+                else:
+                    band = g[new_top:top, left:right]
+                    var, edge = band_stats(band)
+                    if edge >= edge_th or var >= seed_var * var_ratio_min:
+                        top = new_top
+                        expanded_top += (top - new_top)
+                        made_progress = True
+                    else:
+                        stop_top = True
+
+            # BOTTOM
+            if not stop_bottom:
+                new_bottom = min(h, bottom + step_px)
+                if new_bottom <= bottom:
+                    stop_bottom = True
+                else:
+                    band = g[bottom:new_bottom, left:right]
+                    var, edge = band_stats(band)
+                    if edge >= edge_th or var >= seed_var * var_ratio_min:
+                        bottom = new_bottom
+                        expanded_bottom += (new_bottom - bottom)
+                        made_progress = True
+                    else:
+                        stop_bottom = True
+
+            if not made_progress:
+                break
+
+            # safety: do not expand beyond max_expand_px from seed
+            total_expanded = (expanded_left + expanded_right + expanded_top + expanded_bottom)
+            if total_expanded >= max_expand_px:
+                break
+
+        # finalize bbox
+        final_w = max(1, right - left)
+        final_h = max(1, bottom - top)
+        area_ratio = (final_w * final_h) / float(w * h)
+        if area_ratio < min_area_ratio:
+            return None
+
+        # Return as ints
+        return int(left), int(top), int(right), int(bottom)
+    except Exception:
+        logging.exception('[search_logo] falha em adaptive_center_out_crop')
+        return None
+
+
 # --- Helpers de Inicialização ---
 ###############################################################
 # Função utilitária e endpoint para gerar signed URL de conteúdo
@@ -1071,7 +1208,10 @@ async def _search_and_compare_logic(file: UploadFile):
             # computing center-crop / embeddings. This helps when the image contains a
             # embedding. Configure via SEARCH_REMOVE_BOTTOM_PCT (0.0 - 0.5).
             try:
-                remove_bottom_pct = float(os.getenv('SEARCH_REMOVE_BOTTOM_PCT', '0.0'))
+                # Por padrão removemos uma pequena faixa inferior (10%) para evitar
+                # que legendas/descrições abaixo da foto influenciem o embedding.
+                # Pode ser ajustado via SEARCH_REMOVE_BOTTOM_PCT (0.0 - 0.5).
+                remove_bottom_pct = float(os.getenv('SEARCH_REMOVE_BOTTOM_PCT', '0.10'))
             except Exception:
                 remove_bottom_pct = 0.0
 
@@ -1084,12 +1224,52 @@ async def _search_and_compare_logic(file: UploadFile):
                     logging.info(f"[search_logo] removed bottom {remove_bottom_pct*100:.1f}% ({remove_h}px) from image before center-crop to avoid textual caption influence")
 
             side = min(w, h)
-            crop_side = int(side * crop_ratio)
-            left = max(0, (w - crop_side) // 2)
-            top = max(0, (h - crop_side) // 2)
-            right = left + crop_side
-            bottom = top + crop_side
-            center_crop = img.crop((left, top, right, bottom))
+            # Tentar crop adaptativo center-out antes do crop central fixo.
+            try:
+                adaptive_seed_ratio = float(os.getenv('SEARCH_ADAPTIVE_SEED_RATIO', '0.20'))
+                adaptive_step_ratio = float(os.getenv('SEARCH_ADAPTIVE_STEP_RATIO', '0.05'))
+                adaptive_max_expand = float(os.getenv('SEARCH_ADAPTIVE_MAX_EXPAND_RATIO', '0.5'))
+                adaptive_edge_th = float(os.getenv('SEARCH_ADAPTIVE_EDGE_TH', '0.01'))
+                adaptive_var_ratio = float(os.getenv('SEARCH_ADAPTIVE_VAR_RATIO_MIN', '0.4'))
+                adaptive_min_area = float(os.getenv('SEARCH_ADAPTIVE_MIN_AREA_RATIO', '0.01'))
+            except Exception:
+                adaptive_seed_ratio = 0.20
+                adaptive_step_ratio = 0.05
+                adaptive_max_expand = 0.5
+                adaptive_edge_th = 0.01
+                adaptive_var_ratio = 0.4
+                adaptive_min_area = 0.01
+
+            bbox = adaptive_center_out_crop_pil(
+                img,
+                seed_ratio=adaptive_seed_ratio,
+                step_ratio=adaptive_step_ratio,
+                max_expand_ratio=adaptive_max_expand,
+                edge_th=adaptive_edge_th,
+                var_ratio_min=adaptive_var_ratio,
+                min_area_ratio=adaptive_min_area
+            )
+
+            if bbox:
+                left, top, right, bottom = bbox
+                logging.info(f"[search_logo] adaptive crop used bbox={bbox}")
+                center_crop = img.crop((left, top, right, bottom))
+            else:
+                # fallback: fixed center crop (legacy behavior)
+                crop_side = int(side * crop_ratio)
+                left = max(0, (w - crop_side) // 2)
+                # Aplicar deslocamento vertical configurável: desloca o crop para cima
+                # quando crop_vshift > 0 (por exemplo para evitar legendas abaixo do logo).
+                try:
+                    vshift_pixels = int(crop_vshift * max(0, (h - crop_side)))
+                except Exception:
+                    vshift_pixels = 0
+                # Subtrai vshift para mover o crop para cima; garante limites dentro da imagem
+                top = max(0, (h - crop_side) // 2 - vshift_pixels)
+                right = left + crop_side
+                bottom = top + crop_side
+                center_crop = img.crop((left, top, right, bottom))
+
             center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
             center_path = center_tmp.name
             center_crop.save(center_path, format='JPEG', quality=90)
