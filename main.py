@@ -1095,10 +1095,10 @@ async def _search_and_compare_logic(file: UploadFile):
                 results_raw = logo_index.search_raw(qvec, top_k=3)
             except Exception as e:
                 logging.exception('[search_logo] Falha ao consultar índice FAISS: %s', e)
-                return {"found": False, "debug": "Erro interno no índice FAISS", "query_vector": np.array(qvec).tolist()}
+                return {"found": False, "trusted": False, "debug": "Erro interno no índice FAISS", "debug_reason": "faiss_error", "query_vector": np.array(qvec).tolist()}
 
             if not results_raw:
-                return {"found": False, "debug": "Nenhum candidato retornado pelo índice", "query_vector": np.array(qvec).tolist()}
+                return {"found": False, "trusted": False, "debug": "Nenhum candidato retornado pelo índice", "debug_reason": "no_candidates", "query_vector": np.array(qvec).tolist()}
 
             top1 = results_raw[0]
             d1 = float(top1.get('distance', 1.0))
@@ -1106,7 +1106,7 @@ async def _search_and_compare_logic(file: UploadFile):
             # Threshold absoluto
             if d1 > acceptance_threshold:
                 logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> rejeitado")
-                return {"found": False, "debug": "Top1 distance above threshold", "query_vector": np.array(qvec).tolist()}
+                return {"found": False, "trusted": False, "debug": "Top1 distance above threshold", "debug_reason": "distance_above_threshold", "query_vector": np.array(qvec).tolist()}
 
             # Margin entre top1 e top2
             if len(results_raw) > 1:
@@ -1114,7 +1114,7 @@ async def _search_and_compare_logic(file: UploadFile):
                 margin = d2 - d1
                 if margin < min_margin:
                     logging.info(f"[search_logo] margin too small: d2({d2:.4f}) - d1({d1:.4f}) = {margin:.4f} < {min_margin}")
-                    return {"found": False, "debug": "Rejected by margin (ambiguous)", "query_vector": np.array(qvec).tolist(), "d1": d1, "d2": d2}
+                    return {"found": False, "trusted": False, "debug": "Rejected by margin (ambiguous)", "debug_reason": "ambiguous_margin", "query_vector": np.array(qvec).tolist(), "d1": d1, "d2": d2}
 
             # pHash structural check (best-effort)
             phash_hamming = None
@@ -1167,12 +1167,14 @@ async def _search_and_compare_logic(file: UploadFile):
                 logging.exception('[search_logo] erro durante phash check (ignorado): %s', e)
 
             if phash_rejected:
-                return {"found": False, "debug": f"Rejected by phash hamming={phash_hamming}", "query_vector": np.array(qvec).tolist(), "phash_hamming": phash_hamming}
+                return {"found": False, "trusted": False, "debug": f"Rejected by phash hamming={phash_hamming}", "debug_reason": "phash_rejected", "query_vector": np.array(qvec).tolist(), "phash_hamming": phash_hamming}
 
             # Aceitar top1
             match = top1
             return {
                 "found": True,
+                "trusted": True,
+                "debug_reason": "accepted",
                 "name": match['metadata'].get('nome', 'Logo encontrado'),
                 "confidence": float(match.get('confidence', 0)),
                 "distance": float(match.get('distance', 0)),
@@ -1225,7 +1227,7 @@ async def _search_and_compare_logic(file: UploadFile):
             full_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
         except Exception:
             logging.exception('[search_logo] falha ao extrair embedding da imagem full')
-            return {"found": False, "debug": "Erro ao extrair embedding", "query_vector": None}
+            return {"found": False, "trusted": False, "debug": "Erro ao extrair embedding", "debug_reason": "extract_failed", "query_vector": None}
 
         res_full = await _search_and_filter(full_vector, temp_path)
         return res_full
