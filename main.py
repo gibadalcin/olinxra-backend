@@ -1481,18 +1481,24 @@ async def add_logo(
         gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, os.path.basename(file.filename), "logos")
 
         # Calcular pHash e persistir no documento para evitar downloads em runtime
-        phash_value = None
+        # Em produção exigimos que o pHash seja calculado com sucesso. Se a
+        # dependência `imagehash` não estiver disponível ou ocorrer erro ao
+        # calcular o pHash, abortamos o upload para evitar metadados incompletos.
         try:
-            try:
-                import imagehash
-            except Exception:
-                imagehash = None
-            if imagehash is not None:
-                q_img = PILImage.open(temp_path).convert('RGB')
-                q_hash = imagehash.phash(q_img)
-                phash_value = str(q_hash)
+            import imagehash
         except Exception:
-            logging.exception('[add_logo] falha ao calcular pHash (ignorando)')
+            logging.exception('[add_logo] dependência imagehash não disponível')
+            raise HTTPException(status_code=500, detail='Dependência `imagehash` não disponível no servidor; contate o time de infraestrutura.')
+
+        try:
+            q_img = PILImage.open(temp_path).convert('RGB')
+            q_hash = imagehash.phash(q_img)
+            phash_value = str(q_hash)
+        except Exception:
+            logging.exception('[add_logo] falha ao calcular pHash')
+            # Abortamos o upload: preferimos rejeitar a criação do documento a
+            # inserir sem pHash (isso evita inconsistências em produção).
+            raise HTTPException(status_code=500, detail='Falha ao calcular pHash da imagem; upload abortado.')
 
         doc = {
             "nome": name,
