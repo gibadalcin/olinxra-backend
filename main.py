@@ -1255,6 +1255,8 @@ async def _search_and_compare_logic(file: UploadFile):
                 logging.info(f"[search_logo] adaptive crop used bbox={bbox}")
                 center_crop = img.crop((left, top, right, bottom))
             else:
+                # Adaptive crop falhou (retornou None) — registrar parâmetros para diagnóstico
+                logging.info(f"[search_logo] adaptive crop returned None (seed={adaptive_seed_ratio}, step={adaptive_step_ratio}, max_expand={adaptive_max_expand}, edge_th={adaptive_edge_th}, var_ratio_min={adaptive_var_ratio}, min_area={adaptive_min_area}) — fallback to fixed center-crop")
                 # fallback: fixed center crop (legacy behavior)
                 crop_side = int(side * crop_ratio)
                 left = max(0, (w - crop_side) // 2)
@@ -1269,6 +1271,7 @@ async def _search_and_compare_logic(file: UploadFile):
                 right = left + crop_side
                 bottom = top + crop_side
                 center_crop = img.crop((left, top, right, bottom))
+                logging.info(f"[search_logo] fallback center-crop bbox={(left, top, right, bottom)} crop_side={crop_side} vshift_pixels={vshift_pixels}")
 
             center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
             center_path = center_tmp.name
@@ -1292,8 +1295,9 @@ async def _search_and_compare_logic(file: UploadFile):
             # Acceptance threshold for L2 distance. Pode ser sobrescrito via
             # variável de ambiente SEARCH_ACCEPTANCE_THRESHOLD. Se não houver
             # variável disponível no ambiente de deploy, usamos um valor mais
-            # permissivo por padrão (0.60) para reduzir falsos negativos em produção.
-            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.60'))
+            # permissivo por padrão (0.65) para reduzir falsos negativos em produção.
+            # Alterado temporariamente de 0.60 para 0.65 — monitorar métricas após deploy.
+            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.65'))
             min_margin = float(os.getenv('SEARCH_MIN_MARGIN', '0.05'))
             phash_max_hamming = int(os.getenv('SEARCH_PHASH_MAX_HAMMING', '12'))
 
