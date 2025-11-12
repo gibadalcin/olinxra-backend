@@ -1109,7 +1109,11 @@ async def _search_and_compare_logic(file: UploadFile):
         # Função interna para executar busca + filtros (reaproveita lógica existente)
         async def _search_and_filter(qvec, q_img_path):
             import numpy as np
-            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.38'))
+            # Acceptance threshold for L2 distance. Pode ser sobrescrito via
+            # variável de ambiente SEARCH_ACCEPTANCE_THRESHOLD. Se não houver
+            # variável disponível no ambiente de deploy, usamos um valor mais
+            # permissivo por padrão (0.60) para reduzir falsos negativos em produção.
+            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.60'))
             min_margin = float(os.getenv('SEARCH_MIN_MARGIN', '0.05'))
             phash_max_hamming = int(os.getenv('SEARCH_PHASH_MAX_HAMMING', '12'))
 
@@ -1227,6 +1231,30 @@ async def _search_and_compare_logic(file: UploadFile):
                                 logging.exception('[search_logo] erro durante phash check (ignorado)')
                     except Exception as e:
                         logging.exception('[search_logo] erro inesperado no bloco phash: %s', e)
+
+                # pHash override rule: se o pHash indicar alta similaridade, aceitamos
+                # o candidato independentemente do threshold de embedding. Isso é
+                # seguro quando o phash foi persistido no upload (sinal estrutural).
+                try:
+                    phash_override_sim = float(os.getenv('SEARCH_PHASH_OVERRIDE_SIM', '0.95'))
+                except Exception:
+                    phash_override_sim = 0.95
+
+                if phash_similarity is not None and phash_similarity >= phash_override_sim:
+                    logging.info(f"[search_logo] aceitando candidato por pHash override (similarity={phash_similarity:.3f} >= {phash_override_sim})")
+                    # construir resposta de sucesso imediata
+                    candidate = top1.get('metadata', {})
+                    return {
+                        "found": True,
+                        "trusted": True,
+                        "debug": "Accepted by pHash override",
+                        "debug_reason": "phash_override",
+                        "candidate": candidate,
+                        "d1": d1,
+                        "phash_similarity": phash_similarity,
+                        "query_vector": np.array(qvec).tolist(),
+                        "query_vector_norm": np.array(qvec_norm).tolist() if qvec_norm is not None else None,
+                    }
 
                 # Decide using pHash if available, otherwise fallback to emb-only threshold
                 emb_weight = float(os.getenv('SEARCH_EMBEDDING_WEIGHT', '0.85'))
