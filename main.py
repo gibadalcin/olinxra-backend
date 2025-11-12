@@ -1116,72 +1116,137 @@ async def _search_and_compare_logic(file: UploadFile):
                     logging.info(f"[search_logo] margin too small: d2({d2:.4f}) - d1({d1:.4f}) = {margin:.4f} < {min_margin}")
                     return {"found": False, "trusted": False, "debug": "Rejected by margin (ambiguous)", "debug_reason": "ambiguous_margin", "query_vector": np.array(qvec).tolist(), "d1": d1, "d2": d2}
 
-            # pHash structural check (best-effort)
+            # Structural check using combined score (embedding similarity + pHash similarity)
             phash_hamming = None
-            phash_rejected = False
+            phash_similarity = None
             try:
                 try:
                     import imagehash
                 except Exception:
                     imagehash = None
 
+                from io import BytesIO
+                from gcs_utils import get_bucket
+
+                # compute embedding-based similarity (assume confidence ~ 1 - distance)
+                s_e = max(0.0, 1.0 - d1)
+
+                # phash (best-effort)
                 if imagehash is not None:
-                    from io import BytesIO
-                    from gcs_utils import get_bucket
+                    try:
+                        q_img = PILImage.open(q_img_path).convert('RGB')
+                        q_hash = imagehash.phash(q_img)
 
-                    q_img = PILImage.open(q_img_path).convert('RGB')
-                    q_hash = imagehash.phash(q_img)
+                        candidate = top1.get('metadata', {})
+                        candidate_bytes = None
+                        cand_url = candidate.get('url') or candidate.get('gs_url') or candidate.get('gcs_url')
+                        cand_filename = candidate.get('filename') or candidate.get('nome')
 
-                    candidate = top1.get('metadata', {})
-                    candidate_bytes = None
-                    cand_url = candidate.get('url') or candidate.get('gs_url') or candidate.get('gcs_url')
-                    cand_filename = candidate.get('filename') or candidate.get('nome')
+                        if isinstance(cand_url, str) and cand_url.startswith('gs://'):
+                            without_prefix = cand_url[len('gs://'):]
+                            bucket_name, _, path = without_prefix.partition('/')
+                            try:
+                                bucket = get_bucket('logos')
+                                blob = bucket.blob(path)
+                                candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                            except Exception:
+                                logging.exception('[search_logo] falha ao baixar candidato por gs_url')
+                        elif cand_filename:
+                            try:
+                                bucket = get_bucket('logos')
+                                blob = bucket.blob(cand_filename)
+                                candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                            except Exception:
+                                logging.exception('[search_logo] falha ao baixar candidato por filename')
 
-                    if isinstance(cand_url, str) and cand_url.startswith('gs://'):
-                        without_prefix = cand_url[len('gs://'):]
-                        bucket_name, _, path = without_prefix.partition('/')
-                        try:
-                            bucket = get_bucket('logos')
-                            blob = bucket.blob(path)
-                            candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
-                        except Exception:
-                            logging.exception('[search_logo] falha ao baixar candidato por gs_url')
-                    elif cand_filename:
-                        try:
-                            bucket = get_bucket('logos')
-                            blob = bucket.blob(cand_filename)
-                            candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
-                        except Exception:
-                            logging.exception('[search_logo] falha ao baixar candidato por filename')
-
-                    if candidate_bytes:
-                        c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
-                        c_hash = imagehash.phash(c_img)
-                        phash_hamming = int(q_hash - c_hash)
-                        logging.info(f"[search_logo] pHash hamming={phash_hamming} (max={phash_max_hamming}) for candidate={candidate.get('nome')}")
-                        if phash_hamming > phash_max_hamming:
-                            phash_rejected = True
-                    else:
-                        logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
+                        if candidate_bytes:
+                            c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
+                            c_hash = imagehash.phash(c_img)
+                            phash_hamming = int(q_hash - c_hash)
+                            # default bits for phash (hash_size=8 => 64 bits)
+                            phash_bits = int(os.getenv('SEARCH_PHASH_BITS', '64'))
+                            phash_similarity = max(0.0, 1.0 - (phash_hamming / float(phash_bits)))
+                            logging.info(f"[search_logo] pHash hamming={phash_hamming} bits={phash_bits} similarity={phash_similarity:.3f} for candidate={candidate.get('nome')}")
+                        else:
+                            logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
+                    except Exception:
+                        logging.exception('[search_logo] erro durante phash check (ignorado)')
             except Exception as e:
-                logging.exception('[search_logo] erro durante phash check (ignorado): %s', e)
+                logging.exception('[search_logo] erro inesperado no bloco phash: %s', e)
 
-            if phash_rejected:
-                return {"found": False, "trusted": False, "debug": f"Rejected by phash hamming={phash_hamming}", "debug_reason": "phash_rejected", "query_vector": np.array(qvec).tolist(), "phash_hamming": phash_hamming}
+            # Combine scores: embedding similarity (s_e) + phash similarity (s_p)
+            emb_weight = float(os.getenv('SEARCH_EMBEDDING_WEIGHT', '0.85'))
+            phash_weight = float(os.getenv('SEARCH_PHASH_WEIGHT', '0.15'))
+            combined_threshold = float(os.getenv('SEARCH_COMBINED_THRESHOLD', '0.80'))
 
-            # Aceitar top1
-            match = top1
-            return {
-                "found": True,
-                "trusted": True,
-                "debug_reason": "accepted",
-                "name": match['metadata'].get('nome', 'Logo encontrado'),
-                "confidence": float(match.get('confidence', 0)),
-                "distance": float(match.get('distance', 0)),
-                "owner": match['metadata'].get('owner_uid', ''),
-                "query_vector": np.array(qvec).tolist(),
-                "phash_hamming": phash_hamming
-            }
+            s_p = phash_similarity
+            if s_p is not None:
+                combined = emb_weight * s_e + phash_weight * s_p
+                logging.info(f"[search_logo] combined score emb={s_e:.3f} phash={s_p:.3f} combined={combined:.3f} (thr={combined_threshold})")
+                if combined >= combined_threshold:
+                    match = top1
+                    return {
+                        "found": True,
+                        "trusted": True,
+                        "debug_reason": "combined_accepted",
+                        "combined_score": combined,
+                        "emb_similarity": s_e,
+                        "phash_similarity": s_p,
+                        "name": match['metadata'].get('nome', 'Logo encontrado') if (match := top1) else top1['metadata'].get('nome', 'Logo encontrado'),
+                        "confidence": float(top1.get('confidence', 0)),
+                        "distance": float(top1.get('distance', 0)),
+                        "owner": top1['metadata'].get('owner_uid', ''),
+                        "query_vector": np.array(qvec).tolist(),
+                        "phash_hamming": phash_hamming
+                    }
+                else:
+                    # found but not trusted: expose diagnostics so client can decide
+                    return {
+                        "found": True,
+                        "trusted": False,
+                        "debug": f"combined_rejected emb={s_e:.3f} phash={s_p:.3f} comb={combined:.3f}",
+                        "debug_reason": "combined_rejected",
+                        "combined_score": combined,
+                        "emb_similarity": s_e,
+                        "phash_similarity": s_p,
+                        "name": top1['metadata'].get('nome', 'Logo encontrado'),
+                        "confidence": float(top1.get('confidence', 0)),
+                        "distance": float(top1.get('distance', 0)),
+                        "owner": top1['metadata'].get('owner_uid', ''),
+                        "query_vector": np.array(qvec).tolist(),
+                        "phash_hamming": phash_hamming
+                    }
+            else:
+                # No phash available: fallback to embedding similarity alone
+                # Accept if embedding similarity itself meets the combined threshold
+                combined = s_e
+                logging.info(f"[search_logo] no phash available, emb_similarity={s_e:.3f} (thr={combined_threshold})")
+                if combined >= combined_threshold:
+                    match = top1
+                    return {
+                        "found": True,
+                        "trusted": True,
+                        "debug_reason": "emb_only_accepted",
+                        "emb_similarity": s_e,
+                        "name": match['metadata'].get('nome', 'Logo encontrado') if (match := top1) else top1['metadata'].get('nome', 'Logo encontrado'),
+                        "confidence": float(top1.get('confidence', 0)),
+                        "distance": float(top1.get('distance', 0)),
+                        "owner": top1['metadata'].get('owner_uid', ''),
+                        "query_vector": np.array(qvec).tolist()
+                    }
+                else:
+                    return {
+                        "found": True,
+                        "trusted": False,
+                        "debug": f"emb_too_low emb={s_e:.3f}",
+                        "debug_reason": "low_embedding_score",
+                        "emb_similarity": s_e,
+                        "name": top1['metadata'].get('nome', 'Logo encontrado'),
+                        "confidence": float(top1.get('confidence', 0)),
+                        "distance": float(top1.get('distance', 0)),
+                        "owner": top1['metadata'].get('owner_uid', ''),
+                        "query_vector": np.array(qvec).tolist()
+                    }
 
         # Primeiro, tentar com o crop central se disponível
         if center_vector is not None:
