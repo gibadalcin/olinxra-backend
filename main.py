@@ -1138,7 +1138,68 @@ async def _search_and_compare_logic(file: UploadFile):
 
             # Threshold absoluto
             if d1 > acceptance_threshold:
-                logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> rejeitado")
+                logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> checking pHash override")
+                # Tentativa de pHash override antes de rejeitar definitivamente.
+                # Isso permite que candidatos com forte similaridade estrutural
+                # (pHash persistido no upload) sejam aceitos mesmo quando a
+                # distância do embedding está acima do limite.
+                enable_phash = os.getenv('SEARCH_ENABLE_PHASH', 'true').lower() in ('1', 'true', 'yes')
+                phash_similarity = None
+                phash_hamming = None
+
+                if enable_phash:
+                    try:
+                        try:
+                            import imagehash
+                        except Exception:
+                            imagehash = None
+
+                        # Só tenta usar o phash já persistido no documento para evitar
+                        # downloads desnecessários em runtime. O fallback para download
+                        # permanece na seção posterior quando aplicável.
+                        if imagehash is not None:
+                            try:
+                                q_img = PILImage.open(q_img_path).convert('RGB')
+                                q_hash = imagehash.phash(q_img)
+                                candidate = top1.get('metadata', {})
+                                candidate_phash = candidate.get('phash')
+                                if candidate_phash:
+                                    try:
+                                        c_hash = imagehash.hex_to_hash(candidate_phash)
+                                        phash_hamming = int(q_hash - c_hash)
+                                        phash_bits = int(os.getenv('SEARCH_PHASH_BITS', '64'))
+                                        phash_similarity = max(0.0, 1.0 - (phash_hamming / float(phash_bits)))
+                                        logging.info(f"[search_logo] pHash (db) hamming={phash_hamming} bits={phash_bits} similarity={phash_similarity:.3f} for candidate={candidate.get('nome')}")
+                                    except Exception:
+                                        logging.exception('[search_logo] falha ao usar phash persistido (override)')
+                                else:
+                                    logging.debug('[search_logo] candidate has no persisted phash (override path)')
+                            except Exception:
+                                logging.exception('[search_logo] erro ao computar phash da query (override)')
+                    except Exception as e:
+                        logging.exception('[search_logo] erro inesperado ao tentar phash override: %s', e)
+
+                try:
+                    phash_override_sim = float(os.getenv('SEARCH_PHASH_OVERRIDE_SIM', '0.95'))
+                except Exception:
+                    phash_override_sim = 0.95
+
+                if phash_similarity is not None and phash_similarity >= phash_override_sim:
+                    logging.info(f"[search_logo] aceitando candidato por pHash override (similarity={phash_similarity:.3f} >= {phash_override_sim})")
+                    candidate = top1.get('metadata', {})
+                    return {
+                        "found": True,
+                        "trusted": True,
+                        "debug": "Accepted by pHash override",
+                        "debug_reason": "phash_override",
+                        "candidate": candidate,
+                        "d1": d1,
+                        "phash_similarity": phash_similarity,
+                        "query_vector": np.array(qvec).tolist(),
+                        "query_vector_norm": np.array(qvec_norm).tolist() if qvec_norm is not None else None,
+                    }
+
+                # Caso o override não se aplique, rejeitamos como antes
                 return {"found": False, "trusted": False, "debug": "Top1 distance above threshold", "debug_reason": "distance_above_threshold", "query_vector": np.array(qvec).tolist(), "query_vector_norm": np.array(qvec_norm).tolist() if qvec_norm is not None else None}
 
             # Margin entre top1 e top2
