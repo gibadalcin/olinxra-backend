@@ -1177,7 +1177,7 @@ async def _search_and_compare_logic(file: UploadFile):
             # Combine scores: embedding similarity (s_e) + phash similarity (s_p)
             emb_weight = float(os.getenv('SEARCH_EMBEDDING_WEIGHT', '0.85'))
             phash_weight = float(os.getenv('SEARCH_PHASH_WEIGHT', '0.15'))
-            combined_threshold = float(os.getenv('SEARCH_COMBINED_THRESHOLD', '0.80'))
+            combined_threshold = float(os.getenv('SEARCH_COMBINED_THRESHOLD', '0.70'))
 
             s_p = phash_similarity
             if s_p is not None:
