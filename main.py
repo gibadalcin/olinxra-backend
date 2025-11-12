@@ -1368,41 +1368,7 @@ async def upload_cancel(
         logging.exception('[upload_cancel] erro inesperado')
         raise HTTPException(status_code=500, detail='internal error')
 
-    orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
-        from gcs_utils import delete_gs_path
-        for a in orphans:
-            try:
-                fname = a.get('filename')
-                # safety: check if any conteudo references this filename
-                ref = await db['conteudos'].find_one({'$or': [{'blocos.filename': fname}, {'blocos.items.filename': fname}]})
-                if ref:
-                    # mark attached to avoid deletion
-                    await db['uploaded_assets'].update_one({'_id': a['_id']}, {'$set': {'attached': True, 'attached_at': datetime.utcnow(), 'conteudo_id': str(ref.get('_id'))}})
-                    processed.append({'id': str(a.get('_id')), 'status': 'referenced'})
-                    continue
-
-                # delete files
-                try:
-                    if a.get('gs_url'):
-                        await asyncio.to_thread(delete_gs_path, a.get('gs_url'))
-                except Exception:
-                    logging.exception('[admin_cleanup] Falha ao deletar gs_url')
-                try:
-                    if a.get('glb_url'):
-                        await asyncio.to_thread(delete_gs_path, a.get('glb_url'))
-                except Exception:
-                    logging.exception('[admin_cleanup] Falha ao deletar glb_url')
-
-                await db['uploaded_assets'].delete_one({'_id': a['_id']})
-                processed.append({'id': str(a.get('_id')), 'status': 'deleted'})
-            except Exception:
-                logging.exception('[admin_cleanup] Erro ao processar asset')
-                processed.append({'id': str(a.get('_id')), 'status': 'error'})
-    except Exception:
-        logging.exception('[admin_cleanup] Erro ao buscar assets órfãos')
-        raise HTTPException(status_code=500, detail='internal error')
-
-    return {'processed': processed, 'count': len(processed)}
+    
 
 
 @app.post('/api/validate-button-block')
@@ -3444,6 +3410,62 @@ async def admin_process_pending_deletes(token: dict = Depends(verify_firebase_to
                 pass
             processed.append({'id': str(p['_id']), 'status': 'error'})
     return {'processed': processed, 'count': len(processed)}
+
+
+@app.post('/admin/cleanup-uploaded-assets')
+async def admin_cleanup_uploaded_assets(days_old: int = Body(7), token: dict = Depends(verify_firebase_token_dep)):
+    """Limpa uploaded_assets órfãos com mais de `days_old` dias.
+    Lista uploaded_assets onde `attached: False` e `created_at < threshold`, verifica referências
+    em `conteudos`, marca como `attached` se referenciado ou deleta (GCS + DB) caso contrário.
+    Requer que o usuário seja o master definido em USER_ADMIN_EMAIL.
+    """
+    master_email = os.getenv('USER_ADMIN_EMAIL')
+    if token.get('email') != master_email:
+        raise HTTPException(status_code=403, detail='Forbidden')
+
+    try:
+        threshold = datetime.utcnow() - timedelta(days=int(days_old))
+        try:
+            orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
+        except Exception:
+            logging.exception('[admin_cleanup] Erro ao buscar assets órfãos')
+            raise HTTPException(status_code=500, detail='internal error')
+
+        from gcs_utils import delete_gs_path
+        processed = []
+        for a in orphans:
+            try:
+                fname = a.get('filename')
+                # safety: check if any conteudo references this filename
+                ref = await db['conteudos'].find_one({'$or': [{'blocos.filename': fname}, {'blocos.items.filename': fname}]})
+                if ref:
+                    # mark attached to avoid deletion
+                    await db['uploaded_assets'].update_one({'_id': a['_id']}, {'$set': {'attached': True, 'attached_at': datetime.utcnow(), 'conteudo_id': str(ref.get('_id'))}})
+                    processed.append({'id': str(a.get('_id')), 'status': 'referenced'})
+                    continue
+
+                # delete files
+                try:
+                    if a.get('gs_url'):
+                        await asyncio.to_thread(delete_gs_path, a.get('gs_url'))
+                except Exception:
+                    logging.exception('[admin_cleanup] Falha ao deletar gs_url')
+                try:
+                    if a.get('glb_url'):
+                        await asyncio.to_thread(delete_gs_path, a.get('glb_url'))
+                except Exception:
+                    logging.exception('[admin_cleanup] Falha ao deletar glb_url')
+
+                await db['uploaded_assets'].delete_one({'_id': a['_id']})
+                processed.append({'id': str(a.get('_id')), 'status': 'deleted'})
+            except Exception:
+                logging.exception('[admin_cleanup] Erro ao processar asset')
+                processed.append({'id': str(a.get('_id')), 'status': 'error'})
+
+        return {'processed': processed, 'count': len(processed)}
+    except Exception:
+        logging.exception('[admin_cleanup] Erro inesperado em admin_cleanup_uploaded_assets')
+        raise HTTPException(status_code=500, detail='internal error')
 
 
 @app.post('/add-content-image/')
