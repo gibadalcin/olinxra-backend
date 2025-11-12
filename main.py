@@ -1048,17 +1048,17 @@ async def _search_and_compare_logic(file: UploadFile):
             temp_file.write(contents)
             temp_path = temp_file.name
 
-    # heavy CPU work: run in threadpool to avoid blocking event loop
-    # Implementação: extrair embedding do crop central e preferir esse vetor
-    # (evita falsos positivos causados por fundo/texto ao redor). Variáveis de ambiente:
-    # SEARCH_CENTER_CROP_RATIO (float, default 0.5) -- fração do menor lado usada no crop central
-    # SEARCH_CENTER_CROP_VERTICAL_SHIFT (float, default 0.10) -- deslocamento vertical do crop (0..1) para priorizar região central-superior
-    # SEARCH_PREFER_CENTER_ONLY (true/false, default true)
-    # Valor padrão reduzido para 0.5 para priorizar um crop central mais agressivo
-    # e minimizar influência de fundos e textos laterais (correção rápida - Opção 1).
-    crop_ratio = float(os.getenv('SEARCH_CENTER_CROP_RATIO', '0.5'))
-    # vertical shift moves the crop upwards to avoid captions below the logo (positive moves up)
-    crop_vshift = float(os.getenv('SEARCH_CENTER_CROP_VERTICAL_SHIFT', '0.10'))
+        # heavy CPU work: run in threadpool to avoid blocking event loop
+        # Implementação: extrair embedding do crop central e preferir esse vetor
+        # (evita falsos positivos causados por fundo/texto ao redor). Variáveis de ambiente:
+        # SEARCH_CENTER_CROP_RATIO (float, default 0.5) -- fração do menor lado usada no crop central
+        # SEARCH_CENTER_CROP_VERTICAL_SHIFT (float, default 0.10) -- deslocamento vertical do crop (0..1) para priorizar região central-superior
+        # SEARCH_PREFER_CENTER_ONLY (true/false, default true)
+        # Valor padrão reduzido para 0.5 para priorizar um crop central mais agressivo
+        # e minimizar influência de fundos e textos laterais (correção rápida - Opção 1).
+        crop_ratio = float(os.getenv('SEARCH_CENTER_CROP_RATIO', '0.5'))
+        # vertical shift moves the crop upwards to avoid captions below the logo (positive moves up)
+        crop_vshift = float(os.getenv('SEARCH_CENTER_CROP_VERTICAL_SHIFT', '0.10'))
         prefer_center_only = os.getenv('SEARCH_PREFER_CENTER_ONLY', 'true').lower() in ('1', 'true', 'yes')
 
         # Gerar crop central em disco
