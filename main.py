@@ -1295,9 +1295,9 @@ async def _search_and_compare_logic(file: UploadFile):
             # Acceptance threshold for L2 distance. Pode ser sobrescrito via
             # variável de ambiente SEARCH_ACCEPTANCE_THRESHOLD. Se não houver
             # variável disponível no ambiente de deploy, usamos um valor mais
-            # permissivo por padrão (0.65) para reduzir falsos negativos em produção.
-            # Alterado temporariamente de 0.60 para 0.65 — monitorar métricas após deploy.
-            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.65'))
+            # permissivo por padrão (0.67) para reduzir falsos negativos em produção.
+            # Alterado temporariamente de 0.60 para 0.67 — monitorar métricas após deploy.
+            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.67'))
             min_margin = float(os.getenv('SEARCH_MIN_MARGIN', '0.05'))
             phash_max_hamming = int(os.getenv('SEARCH_PHASH_MAX_HAMMING', '12'))
 
