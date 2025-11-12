@@ -13,6 +13,9 @@ import logging
 import argparse
 from io import BytesIO
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from motor.motor_asyncio import AsyncIOMotorClient
 import httpx
 from PIL import Image as PILImage
