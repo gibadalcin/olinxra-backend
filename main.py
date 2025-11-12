@@ -1051,20 +1051,109 @@ async def _search_and_compare_logic(file: UploadFile):
         # heavy CPU work: run in threadpool to avoid blocking event loop
         query_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
         import numpy as np
-        results = logo_index.search(query_vector, top_k=1)
 
-        if results:
-            match = results[0]
-            return {
-                "found": True,
-                "name": match['metadata'].get('nome', 'Logo encontrado'),
-                "confidence": float(match.get('confidence', 0)),
-                "distance": float(match.get('distance', 0)),
-                "owner": match['metadata'].get('owner_uid', ''),
-                "query_vector": np.array(query_vector).tolist()
-            }
+        # Configuráveis via ENV para tuning em runtime
+        acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.38'))
+        min_margin = float(os.getenv('SEARCH_MIN_MARGIN', '0.05'))
+        phash_max_hamming = int(os.getenv('SEARCH_PHASH_MAX_HAMMING', '12'))
 
-        return {"found": False, "debug": "Nenhum match encontrado", "query_vector": np.array(query_vector).tolist()}
+        # Pedir top-3 candidatos para permitir margem entre top1/top2
+        try:
+            results_raw = logo_index.search_raw(query_vector, top_k=3)
+        except Exception as e:
+            logging.exception('[search_logo] Falha ao consultar índice FAISS: %s', e)
+            return {"found": False, "debug": "Erro interno no índice FAISS", "query_vector": np.array(query_vector).tolist()}
+
+        if not results_raw:
+            return {"found": False, "debug": "Nenhum candidato retornado pelo índice", "query_vector": np.array(query_vector).tolist()}
+
+        top1 = results_raw[0]
+        d1 = float(top1.get('distance', 1.0))
+
+        # 1) Threshold absoluto
+        if d1 > acceptance_threshold:
+            logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> rejeitado")
+            return {"found": False, "debug": "Top1 distance above threshold", "query_vector": np.array(query_vector).tolist()}
+
+        # 2) Margin entre top1 e top2 (evitar aceitar quando o segundo candidato está quase tão próximo)
+        margin_ok = True
+        if len(results_raw) > 1:
+            d2 = float(results_raw[1].get('distance', 1.0))
+            margin = d2 - d1
+            if margin < min_margin:
+                logging.info(f"[search_logo] margin too small: d2({d2:.4f}) - d1({d1:.4f}) = {margin:.4f} < {min_margin}")
+                margin_ok = False
+
+        if not margin_ok:
+            return {"found": False, "debug": "Rejected by margin (ambiguous)", "query_vector": np.array(query_vector).tolist(), "d1": d1, "d2": (d2 if 'd2' in locals() else None)}
+
+        # 3) pHash structural check (best-effort). Só rejeita se pHash indicar diferença estrutural
+        phash_hamming = None
+        phash_rejected = False
+        try:
+            try:
+                import imagehash
+            except Exception:
+                imagehash = None
+
+            if imagehash is not None:
+                from io import BytesIO
+                from gcs_utils import get_bucket
+
+                # hash da query
+                q_img = PILImage.open(temp_path).convert('RGB')
+                q_hash = imagehash.phash(q_img)
+
+                # tentar obter bytes do candidato (metadata pode ter url/gs_url/filename)
+                candidate = top1.get('metadata', {})
+                candidate_bytes = None
+                cand_url = candidate.get('url') or candidate.get('gs_url') or candidate.get('gcs_url')
+                cand_filename = candidate.get('filename') or candidate.get('nome')
+
+                if isinstance(cand_url, str) and cand_url.startswith('gs://'):
+                    # gs://bucket/path
+                    without_prefix = cand_url[len('gs://'):]
+                    bucket_name, _, path = without_prefix.partition('/')
+                    try:
+                        bucket = get_bucket('logos' if (GCS_BUCKET_LOGOS and bucket_name == GCS_BUCKET_LOGOS) else 'logos')
+                        blob = bucket.blob(path)
+                        candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                    except Exception:
+                        logging.exception('[search_logo] falha ao baixar candidato por gs_url')
+                elif cand_filename:
+                    try:
+                        bucket = get_bucket('logos')
+                        blob = bucket.blob(cand_filename)
+                        candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                    except Exception:
+                        logging.exception('[search_logo] falha ao baixar candidato por filename')
+
+                if candidate_bytes:
+                    c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
+                    c_hash = imagehash.phash(c_img)
+                    phash_hamming = int(q_hash - c_hash)
+                    logging.info(f"[search_logo] pHash hamming={phash_hamming} (max={phash_max_hamming}) for candidate={candidate.get('nome')}")
+                    if phash_hamming > phash_max_hamming:
+                        phash_rejected = True
+                else:
+                    logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
+        except Exception as e:
+            logging.exception('[search_logo] erro durante phash check (ignorado): %s', e)
+
+        if phash_rejected:
+            return {"found": False, "debug": f"Rejected by phash hamming={phash_hamming}", "query_vector": np.array(query_vector).tolist(), "phash_hamming": phash_hamming}
+
+        # Aceitar candidato top1
+        match = top1
+        return {
+            "found": True,
+            "name": match['metadata'].get('nome', 'Logo encontrado'),
+            "confidence": float(match.get('confidence', 0)),
+            "distance": float(match.get('distance', 0)),
+            "owner": match['metadata'].get('owner_uid', ''),
+            "query_vector": np.array(query_vector).tolist(),
+            "phash_hamming": phash_hamming
+        }
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)

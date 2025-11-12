@@ -52,3 +52,29 @@ class LogoIndex:
         print(f"{'='*60}\n")
         
         return results
+
+    def search_raw(self, query_vector, top_k=5):
+        """
+        Retorna os top_k resultados do índice (sem aplicar o threshold interno).
+        Útil para aplicar filtros adicionais (margin, phash, etc.) no nível do
+        handler que chama o índice.
+        """
+        query_vector = query_vector / np.linalg.norm(query_vector)
+        D, I = self.index.search(np.expand_dims(query_vector, axis=0), top_k)
+
+        results = []
+        for i in range(len(I[0])):
+            logo_index = I[0][i]
+            distance = float(D[0][i])
+            # proteger contra índices inválidos
+            if logo_index < 0 or logo_index >= len(self.metadata):
+                continue
+            metadata = self.metadata[logo_index]
+            confidence = 1 / (1 + distance)
+            results.append({
+                "distance": distance,
+                "confidence": round(confidence * 100, 2),
+                "metadata": metadata
+            })
+
+        return results

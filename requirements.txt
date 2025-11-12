@@ -9,3 +9,4 @@ onnxruntime>=1.17.0
 faiss-cpu
 motor>=3.7.1
 pygltflib
+imagehash
