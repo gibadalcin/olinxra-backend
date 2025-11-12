@@ -1177,37 +1177,52 @@ async def _search_and_compare_logic(file: UploadFile):
                                 q_hash = imagehash.phash(q_img)
 
                                 candidate = top1.get('metadata', {})
+                                # Se o pHash do candidato foi persistido no upload, use-o (evita download)
+                                candidate_phash = candidate.get('phash')
+                                if candidate_phash:
+                                    try:
+                                        # reconstrói ImageHash a partir do hex salvo
+                                        c_hash = imagehash.hex_to_hash(candidate_phash)
+                                        phash_hamming = int(q_hash - c_hash)
+                                        phash_bits = int(os.getenv('SEARCH_PHASH_BITS', '64'))
+                                        phash_similarity = max(0.0, 1.0 - (phash_hamming / float(phash_bits)))
+                                        logging.info(f"[search_logo] pHash (db) hamming={phash_hamming} bits={phash_bits} similarity={phash_similarity:.3f} for candidate={candidate.get('nome')}")
+                                    except Exception:
+                                        logging.exception('[search_logo] falha ao usar phash persistido (tentando download)')
+                                        candidate_phash = None
+
                                 candidate_bytes = None
                                 cand_url = candidate.get('url') or candidate.get('gs_url') or candidate.get('gcs_url')
                                 cand_filename = candidate.get('filename') or candidate.get('nome')
 
-                                if isinstance(cand_url, str) and cand_url.startswith('gs://'):
-                                    without_prefix = cand_url[len('gs://'):]
-                                    bucket_name, _, path = without_prefix.partition('/')
-                                    try:
-                                        bucket = get_bucket('logos')
-                                        blob = bucket.blob(path)
-                                        candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
-                                    except Exception:
-                                        logging.exception('[search_logo] falha ao baixar candidato por gs_url')
-                                elif cand_filename:
-                                    try:
-                                        bucket = get_bucket('logos')
-                                        blob = bucket.blob(cand_filename)
-                                        candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
-                                    except Exception:
-                                        logging.exception('[search_logo] falha ao baixar candidato por filename')
+                                # Se ainda não obtivemos phash do DB, tentar baixar e calcular (fallback antigo)
+                                if candidate_phash is None:
+                                    if isinstance(cand_url, str) and cand_url.startswith('gs://'):
+                                        without_prefix = cand_url[len('gs://'):]
+                                        bucket_name, _, path = without_prefix.partition('/')
+                                        try:
+                                            bucket = get_bucket('logos')
+                                            blob = bucket.blob(path)
+                                            candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                                        except Exception:
+                                            logging.exception('[search_logo] falha ao baixar candidato por gs_url')
+                                    elif cand_filename:
+                                        try:
+                                            bucket = get_bucket('logos')
+                                            blob = bucket.blob(cand_filename)
+                                            candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                                        except Exception:
+                                            logging.exception('[search_logo] falha ao baixar candidato por filename')
 
-                                if candidate_bytes:
-                                    c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
-                                    c_hash = imagehash.phash(c_img)
-                                    phash_hamming = int(q_hash - c_hash)
-                                    # default bits for phash (hash_size=8 => 64 bits)
-                                    phash_bits = int(os.getenv('SEARCH_PHASH_BITS', '64'))
-                                    phash_similarity = max(0.0, 1.0 - (phash_hamming / float(phash_bits)))
-                                    logging.info(f"[search_logo] pHash hamming={phash_hamming} bits={phash_bits} similarity={phash_similarity:.3f} for candidate={candidate.get('nome')}")
-                                else:
-                                    logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
+                                    if candidate_bytes:
+                                        c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
+                                        c_hash = imagehash.phash(c_img)
+                                        phash_hamming = int(q_hash - c_hash)
+                                        phash_bits = int(os.getenv('SEARCH_PHASH_BITS', '64'))
+                                        phash_similarity = max(0.0, 1.0 - (phash_hamming / float(phash_bits)))
+                                        logging.info(f"[search_logo] pHash hamming={phash_hamming} bits={phash_bits} similarity={phash_similarity:.3f} for candidate={candidate.get('nome')}")
+                                    else:
+                                        logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
                             except Exception:
                                 logging.exception('[search_logo] erro durante phash check (ignorado)')
                     except Exception as e:
@@ -1464,12 +1479,28 @@ async def add_logo(
         features /= np.linalg.norm(features)
         # Upload ao GCS pode envolver I/O síncrono; executa em threadpool também
         gcs_url = await asyncio.to_thread(upload_image_to_gcs, temp_path, os.path.basename(file.filename), "logos")
+
+        # Calcular pHash e persistir no documento para evitar downloads em runtime
+        phash_value = None
+        try:
+            try:
+                import imagehash
+            except Exception:
+                imagehash = None
+            if imagehash is not None:
+                q_img = PILImage.open(temp_path).convert('RGB')
+                q_hash = imagehash.phash(q_img)
+                phash_value = str(q_hash)
+        except Exception:
+            logging.exception('[add_logo] falha ao calcular pHash (ignorando)')
+
         doc = {
             "nome": name,
             "url": gcs_url,
             "filename": os.path.basename(file.filename),
             "owner_uid": token["uid"],
-            "vector": features.tolist()
+            "vector": features.tolist(),
+            "phash": phash_value
         }
         result = await logos_collection.insert_one(doc)
     except Exception as e:
