@@ -1049,111 +1049,186 @@ async def _search_and_compare_logic(file: UploadFile):
             temp_path = temp_file.name
 
         # heavy CPU work: run in threadpool to avoid blocking event loop
-        query_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
-        import numpy as np
+        # Implementação: extrair embedding do crop central e preferir esse vetor
+        # (evita falsos positivos causados por fundo). Variáveis de ambiente:
+        # SEARCH_CENTER_CROP_RATIO (float, default 0.7)
+        # SEARCH_PREFER_CENTER_ONLY (true/false, default true)
+        crop_ratio = float(os.getenv('SEARCH_CENTER_CROP_RATIO', '0.7'))
+        prefer_center_only = os.getenv('SEARCH_PREFER_CENTER_ONLY', 'true').lower() in ('1', 'true', 'yes')
 
-        # Configuráveis via ENV para tuning em runtime
-        acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.38'))
-        min_margin = float(os.getenv('SEARCH_MIN_MARGIN', '0.05'))
-        phash_max_hamming = int(os.getenv('SEARCH_PHASH_MAX_HAMMING', '12'))
-
-        # Pedir top-3 candidatos para permitir margem entre top1/top2
+        # Gerar crop central em disco
+        center_path = None
         try:
-            results_raw = logo_index.search_raw(query_vector, top_k=3)
-        except Exception as e:
-            logging.exception('[search_logo] Falha ao consultar índice FAISS: %s', e)
-            return {"found": False, "debug": "Erro interno no índice FAISS", "query_vector": np.array(query_vector).tolist()}
+            img = PILImage.open(temp_path).convert('RGB')
+            w, h = img.size
+            side = min(w, h)
+            crop_side = int(side * crop_ratio)
+            left = max(0, (w - crop_side) // 2)
+            top = max(0, (h - crop_side) // 2)
+            right = left + crop_side
+            bottom = top + crop_side
+            center_crop = img.crop((left, top, right, bottom))
+            center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+            center_path = center_tmp.name
+            center_crop.save(center_path, format='JPEG', quality=90)
+        except Exception:
+            logging.exception('[search_logo] falha ao gerar crop central; prosseguindo com imagem full')
+            center_path = None
 
-        if not results_raw:
-            return {"found": False, "debug": "Nenhum candidato retornado pelo índice", "query_vector": np.array(query_vector).tolist()}
-
-        top1 = results_raw[0]
-        d1 = float(top1.get('distance', 1.0))
-
-        # 1) Threshold absoluto
-        if d1 > acceptance_threshold:
-            logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> rejeitado")
-            return {"found": False, "debug": "Top1 distance above threshold", "query_vector": np.array(query_vector).tolist()}
-
-        # 2) Margin entre top1 e top2 (evitar aceitar quando o segundo candidato está quase tão próximo)
-        margin_ok = True
-        if len(results_raw) > 1:
-            d2 = float(results_raw[1].get('distance', 1.0))
-            margin = d2 - d1
-            if margin < min_margin:
-                logging.info(f"[search_logo] margin too small: d2({d2:.4f}) - d1({d1:.4f}) = {margin:.4f} < {min_margin}")
-                margin_ok = False
-
-        if not margin_ok:
-            return {"found": False, "debug": "Rejected by margin (ambiguous)", "query_vector": np.array(query_vector).tolist(), "d1": d1, "d2": (d2 if 'd2' in locals() else None)}
-
-        # 3) pHash structural check (best-effort). Só rejeita se pHash indicar diferença estrutural
-        phash_hamming = None
-        phash_rejected = False
-        try:
+        # Extrair embedding do crop (se criado)
+        center_vector = None
+        if center_path:
             try:
-                import imagehash
+                center_vector = await asyncio.to_thread(extract_clip_features, center_path, ort_session)
             except Exception:
-                imagehash = None
+                logging.exception('[search_logo] falha ao extrair embedding do crop central')
+                center_vector = None
 
-            if imagehash is not None:
-                from io import BytesIO
-                from gcs_utils import get_bucket
+        # Função interna para executar busca + filtros (reaproveita lógica existente)
+        async def _search_and_filter(qvec, q_img_path):
+            import numpy as np
+            acceptance_threshold = float(os.getenv('SEARCH_ACCEPTANCE_THRESHOLD', '0.38'))
+            min_margin = float(os.getenv('SEARCH_MIN_MARGIN', '0.05'))
+            phash_max_hamming = int(os.getenv('SEARCH_PHASH_MAX_HAMMING', '12'))
 
-                # hash da query
-                q_img = PILImage.open(temp_path).convert('RGB')
-                q_hash = imagehash.phash(q_img)
+            try:
+                results_raw = logo_index.search_raw(qvec, top_k=3)
+            except Exception as e:
+                logging.exception('[search_logo] Falha ao consultar índice FAISS: %s', e)
+                return {"found": False, "debug": "Erro interno no índice FAISS", "query_vector": np.array(qvec).tolist()}
 
-                # tentar obter bytes do candidato (metadata pode ter url/gs_url/filename)
-                candidate = top1.get('metadata', {})
-                candidate_bytes = None
-                cand_url = candidate.get('url') or candidate.get('gs_url') or candidate.get('gcs_url')
-                cand_filename = candidate.get('filename') or candidate.get('nome')
+            if not results_raw:
+                return {"found": False, "debug": "Nenhum candidato retornado pelo índice", "query_vector": np.array(qvec).tolist()}
 
-                if isinstance(cand_url, str) and cand_url.startswith('gs://'):
-                    # gs://bucket/path
-                    without_prefix = cand_url[len('gs://'):]
-                    bucket_name, _, path = without_prefix.partition('/')
+            top1 = results_raw[0]
+            d1 = float(top1.get('distance', 1.0))
+
+            # Threshold absoluto
+            if d1 > acceptance_threshold:
+                logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> rejeitado")
+                return {"found": False, "debug": "Top1 distance above threshold", "query_vector": np.array(qvec).tolist()}
+
+            # Margin entre top1 e top2
+            if len(results_raw) > 1:
+                d2 = float(results_raw[1].get('distance', 1.0))
+                margin = d2 - d1
+                if margin < min_margin:
+                    logging.info(f"[search_logo] margin too small: d2({d2:.4f}) - d1({d1:.4f}) = {margin:.4f} < {min_margin}")
+                    return {"found": False, "debug": "Rejected by margin (ambiguous)", "query_vector": np.array(qvec).tolist(), "d1": d1, "d2": d2}
+
+            # pHash structural check (best-effort)
+            phash_hamming = None
+            phash_rejected = False
+            try:
+                try:
+                    import imagehash
+                except Exception:
+                    imagehash = None
+
+                if imagehash is not None:
+                    from io import BytesIO
+                    from gcs_utils import get_bucket
+
+                    q_img = PILImage.open(q_img_path).convert('RGB')
+                    q_hash = imagehash.phash(q_img)
+
+                    candidate = top1.get('metadata', {})
+                    candidate_bytes = None
+                    cand_url = candidate.get('url') or candidate.get('gs_url') or candidate.get('gcs_url')
+                    cand_filename = candidate.get('filename') or candidate.get('nome')
+
+                    if isinstance(cand_url, str) and cand_url.startswith('gs://'):
+                        without_prefix = cand_url[len('gs://'):]
+                        bucket_name, _, path = without_prefix.partition('/')
+                        try:
+                            bucket = get_bucket('logos')
+                            blob = bucket.blob(path)
+                            candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                        except Exception:
+                            logging.exception('[search_logo] falha ao baixar candidato por gs_url')
+                    elif cand_filename:
+                        try:
+                            bucket = get_bucket('logos')
+                            blob = bucket.blob(cand_filename)
+                            candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                        except Exception:
+                            logging.exception('[search_logo] falha ao baixar candidato por filename')
+
+                    if candidate_bytes:
+                        c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
+                        c_hash = imagehash.phash(c_img)
+                        phash_hamming = int(q_hash - c_hash)
+                        logging.info(f"[search_logo] pHash hamming={phash_hamming} (max={phash_max_hamming}) for candidate={candidate.get('nome')}")
+                        if phash_hamming > phash_max_hamming:
+                            phash_rejected = True
+                    else:
+                        logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
+            except Exception as e:
+                logging.exception('[search_logo] erro durante phash check (ignorado): %s', e)
+
+            if phash_rejected:
+                return {"found": False, "debug": f"Rejected by phash hamming={phash_hamming}", "query_vector": np.array(qvec).tolist(), "phash_hamming": phash_hamming}
+
+            # Aceitar top1
+            match = top1
+            return {
+                "found": True,
+                "name": match['metadata'].get('nome', 'Logo encontrado'),
+                "confidence": float(match.get('confidence', 0)),
+                "distance": float(match.get('distance', 0)),
+                "owner": match['metadata'].get('owner_uid', ''),
+                "query_vector": np.array(qvec).tolist(),
+                "phash_hamming": phash_hamming
+            }
+
+        # Primeiro, tentar com o crop central se disponível
+        if center_vector is not None:
+            res_center = await _search_and_filter(center_vector, center_path)
+            # Se preferir apenas center, retornamos direto
+            if prefer_center_only:
+                # cleanup temp center file
+                try:
+                    if center_path and os.path.exists(center_path):
+                        os.remove(center_path)
+                except Exception:
+                    pass
+                return res_center
+
+            # Se crop não aceitou, tentar com a imagem completa
+            if not res_center.get('found'):
+                try:
+                    full_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
+                except Exception:
+                    logging.exception('[search_logo] falha ao extrair embedding da imagem full')
+                    # cleanup
                     try:
-                        bucket = get_bucket('logos' if (GCS_BUCKET_LOGOS and bucket_name == GCS_BUCKET_LOGOS) else 'logos')
-                        blob = bucket.blob(path)
-                        candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
+                        if center_path and os.path.exists(center_path):
+                            os.remove(center_path)
                     except Exception:
-                        logging.exception('[search_logo] falha ao baixar candidato por gs_url')
-                elif cand_filename:
-                    try:
-                        bucket = get_bucket('logos')
-                        blob = bucket.blob(cand_filename)
-                        candidate_bytes = await asyncio.to_thread(blob.download_as_bytes)
-                    except Exception:
-                        logging.exception('[search_logo] falha ao baixar candidato por filename')
+                        pass
+                    return res_center
 
-                if candidate_bytes:
-                    c_img = PILImage.open(BytesIO(candidate_bytes)).convert('RGB')
-                    c_hash = imagehash.phash(c_img)
-                    phash_hamming = int(q_hash - c_hash)
-                    logging.info(f"[search_logo] pHash hamming={phash_hamming} (max={phash_max_hamming}) for candidate={candidate.get('nome')}")
-                    if phash_hamming > phash_max_hamming:
-                        phash_rejected = True
-                else:
-                    logging.debug('[search_logo] candidate image bytes not available for phash check; skipping')
-        except Exception as e:
-            logging.exception('[search_logo] erro durante phash check (ignorado): %s', e)
+                res_full = await _search_and_filter(full_vector, temp_path)
+                # cleanup
+                try:
+                    if center_path and os.path.exists(center_path):
+                        os.remove(center_path)
+                except Exception:
+                    pass
+                # preferir resultado da full se aceitou, senão retornar res_center (mais conservador)
+                if res_full.get('found'):
+                    return res_full
+                return res_center
 
-        if phash_rejected:
-            return {"found": False, "debug": f"Rejected by phash hamming={phash_hamming}", "query_vector": np.array(query_vector).tolist(), "phash_hamming": phash_hamming}
+        # Se não houve crop (erro), cair back para comportamento anterior com full image
+        try:
+            full_vector = await asyncio.to_thread(extract_clip_features, temp_path, ort_session)
+        except Exception:
+            logging.exception('[search_logo] falha ao extrair embedding da imagem full')
+            return {"found": False, "debug": "Erro ao extrair embedding", "query_vector": None}
 
-        # Aceitar candidato top1
-        match = top1
-        return {
-            "found": True,
-            "name": match['metadata'].get('nome', 'Logo encontrado'),
-            "confidence": float(match.get('confidence', 0)),
-            "distance": float(match.get('distance', 0)),
-            "owner": match['metadata'].get('owner_uid', ''),
-            "query_vector": np.array(query_vector).tolist(),
-            "phash_hamming": phash_hamming
-        }
+        res_full = await _search_and_filter(full_vector, temp_path)
+        return res_full
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
