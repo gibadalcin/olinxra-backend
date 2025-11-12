@@ -1048,12 +1048,17 @@ async def _search_and_compare_logic(file: UploadFile):
             temp_file.write(contents)
             temp_path = temp_file.name
 
-        # heavy CPU work: run in threadpool to avoid blocking event loop
-        # Implementação: extrair embedding do crop central e preferir esse vetor
-        # (evita falsos positivos causados por fundo). Variáveis de ambiente:
-        # SEARCH_CENTER_CROP_RATIO (float, default 0.7)
-        # SEARCH_PREFER_CENTER_ONLY (true/false, default true)
-        crop_ratio = float(os.getenv('SEARCH_CENTER_CROP_RATIO', '0.7'))
+    # heavy CPU work: run in threadpool to avoid blocking event loop
+    # Implementação: extrair embedding do crop central e preferir esse vetor
+    # (evita falsos positivos causados por fundo/texto ao redor). Variáveis de ambiente:
+    # SEARCH_CENTER_CROP_RATIO (float, default 0.5) -- fração do menor lado usada no crop central
+    # SEARCH_CENTER_CROP_VERTICAL_SHIFT (float, default 0.10) -- deslocamento vertical do crop (0..1) para priorizar região central-superior
+    # SEARCH_PREFER_CENTER_ONLY (true/false, default true)
+    # Valor padrão reduzido para 0.5 para priorizar um crop central mais agressivo
+    # e minimizar influência de fundos e textos laterais (correção rápida - Opção 1).
+    crop_ratio = float(os.getenv('SEARCH_CENTER_CROP_RATIO', '0.5'))
+    # vertical shift moves the crop upwards to avoid captions below the logo (positive moves up)
+    crop_vshift = float(os.getenv('SEARCH_CENTER_CROP_VERTICAL_SHIFT', '0.10'))
         prefer_center_only = os.getenv('SEARCH_PREFER_CENTER_ONLY', 'true').lower() in ('1', 'true', 'yes')
 
         # Gerar crop central em disco
@@ -1061,6 +1066,23 @@ async def _search_and_compare_logic(file: UploadFile):
         try:
             img = PILImage.open(temp_path).convert('RGB')
             w, h = img.size
+
+            # Optional quick heuristic: remove bottom band (e.g. textual brand label) before
+            # computing center-crop / embeddings. This helps when the image contains a
+            # embedding. Configure via SEARCH_REMOVE_BOTTOM_PCT (0.0 - 0.5).
+            try:
+                remove_bottom_pct = float(os.getenv('SEARCH_REMOVE_BOTTOM_PCT', '0.0'))
+            except Exception:
+                remove_bottom_pct = 0.0
+
+            if remove_bottom_pct and remove_bottom_pct > 0.0 and remove_bottom_pct < 0.5:
+                remove_h = int(h * remove_bottom_pct)
+                if remove_h > 10:
+                    # crop top..(h - remove_h)
+                    img = img.crop((0, 0, w, h - remove_h))
+                    w, h = img.size
+                    logging.info(f"[search_logo] removed bottom {remove_bottom_pct*100:.1f}% ({remove_h}px) from image before center-crop to avoid textual caption influence")
+
             side = min(w, h)
             crop_side = int(side * crop_ratio)
             left = max(0, (w - crop_side) // 2)
@@ -1340,22 +1362,27 @@ async def upload_cancel(
         await db['uploaded_assets'].delete_one({'_id': asset['_id']})
         return {'ok': True, 'deleted': True}
     except HTTPException:
-        raise
-    except Exception:
-        logging.exception('[upload_cancel] Erro ao cancelar upload')
-        raise HTTPException(status_code=500, detail='internal error')
-
-
-@app.post('/admin/cleanup-uploaded-assets')
-async def admin_cleanup_uploaded_assets(token: dict = Depends(verify_firebase_token_dep)):
-    # Only allow master admin to trigger
-    master_email = os.getenv('USER_ADMIN_EMAIL')
-    if token.get('email') != master_email:
-        raise HTTPException(status_code=403, detail='Forbidden')
-
-    threshold = datetime.utcnow() - timedelta(days=7)
-    processed = []
-    try:
+            try:
+                img = PILImage.open(temp_path).convert('RGB')
+                w, h = img.size
+                side = min(w, h)
+                crop_side = int(side * crop_ratio)
+                # horizontal center
+                left = max(0, int((w - crop_side) // 2))
+                # vertical center with optional upward bias to avoid captions below logos
+                extra_v = max(0, h - crop_side)
+                center_top = int(extra_v // 2)
+                # shift upwards by a fraction of the extra vertical space
+                top = max(0, int(center_top - crop_vshift * extra_v))
+                right = left + crop_side
+                bottom = top + crop_side
+                center_crop = img.crop((left, top, right, bottom))
+                center_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                center_path = center_tmp.name
+                center_crop.save(center_path, format='JPEG', quality=90)
+            except Exception:
+                logging.exception('[search_logo] falha ao gerar crop central; prosseguindo com imagem full')
+                center_path = None
         orphans = await db['uploaded_assets'].find({'attached': False, 'created_at': {'$lt': threshold}}).to_list(length=1000)
         from gcs_utils import delete_gs_path
         for a in orphans:
