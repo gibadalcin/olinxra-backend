@@ -2201,9 +2201,9 @@ async def api_generate_glb_from_image(payload: dict = Body(...), request: Reques
 
             # Allow callers to override UV flips per-content (useful to correct
             # orientation differences between viewers/camera preview). Accepts
-            # boolean values or strings 'true'/'false'. Defaults chosen to avoid
-            # horizontal mirroring while keeping the vertical orientation that
-            # works for most mobile viewers.
+            # boolean values or strings 'true'/'false'. Defaults escolhidos para evitar
+            # espelhamento horizontal, mantendo a orientação vertical que
+            # funciona para a maioria dos visualizadores móveis.
             def _to_bool(v, default=False):
                 try:
                     if v is None:
@@ -3087,7 +3087,7 @@ async def get_conteudo_por_regiao(
     if not marca:
         return {"blocos": []}
 
-    # Busca conteúdo associado à marca e região
+    # Busca conteúdo associado à marca e região usando a função
     filtro = {"nome_marca": nome_marca}
     if tipo_regiao:
         filtro["tipo_regiao"] = tipo_regiao
@@ -3351,7 +3351,9 @@ async def post_conteudo(
                     b['filename'] = filename
                     if not b.get('url'):
                         b['url'] = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
-        
+            except Exception as e:
+                logging.error(f"[post_conteudo] Erro ao pós-processar bloco: {e}")
+
         if invalid_blocks:
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
@@ -3667,7 +3669,7 @@ async def post_conteudo(
                     new_filenames = set()
                     for nb in cleaned_blocos:
                         if nb.get('items') and isinstance(nb.get('items'), list):
-                            for it in nb['items']:
+                            for it in nb.get('items'):
                                 if it:
                                     if it.get('url'): new_urls.add(str(it.get('url')))
                                     if it.get('filename'): new_filenames.add(str(it.get('filename')))
