@@ -1358,6 +1358,49 @@ async def _search_and_compare_logic(file: UploadFile):
             top1 = results_raw[0]
             d1 = float(top1.get('distance', 1.0))
 
+            # PATCH: Aceitação imediata se embedding ou pHash forem idênticos
+            candidate = top1.get('metadata', {})
+            # Se embedding for idêntico (distância zero)
+            if d1 == 0.0:
+                logging.info("[search_logo] Aceitando por embedding idêntico (distância zero)")
+                return {
+                    "found": True,
+                    "trusted": True,
+                    "debug": "Accepted by exact embedding match",
+                    "debug_reason": "embedding_exact_match",
+                    "candidate": candidate,
+                    "d1": d1,
+                    "query_vector": np.array(qvec).tolist(),
+                    "query_vector_norm": np.array(qvec_norm).tolist() if qvec_norm is not None else None,
+                }
+
+            # Se pHash for idêntico (hamming zero)
+            candidate_phash = candidate.get('phash')
+            phash_hamming = None
+            phash_similarity = None
+            try:
+                import imagehash
+                q_img = PILImage.open(q_img_path).convert('RGB')
+                q_hash = imagehash.phash(q_img)
+                if candidate_phash:
+                    c_hash = imagehash.hex_to_hash(candidate_phash)
+                    phash_hamming = int(q_hash - c_hash)
+                    if phash_hamming == 0:
+                        logging.info("[search_logo] Aceitando por pHash idêntico (hamming zero)")
+                        return {
+                            "found": True,
+                            "trusted": True,
+                            "debug": "Accepted by exact pHash match",
+                            "debug_reason": "phash_exact_match",
+                            "candidate": candidate,
+                            "d1": d1,
+                            "phash_hamming": phash_hamming,
+                            "query_vector": np.array(qvec).tolist(),
+                            "query_vector_norm": np.array(qvec_norm).tolist() if qvec_norm is not None else None,
+                        }
+            except Exception:
+                pass
+
             # Threshold absoluto
             if d1 > acceptance_threshold:
                 logging.info(f"[search_logo] top1 distance {d1:.4f} > threshold {acceptance_threshold} -> checking pHash override")
