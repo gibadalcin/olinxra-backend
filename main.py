@@ -1059,16 +1059,12 @@ async def attach_signed_urls_to_blocos_fast(blocos):
                             else:
                                 preview_gs = f"gs://{GCS_BUCKET_CONTEUDO}/{preview_fn}"
 
-                                # Para previews, é preferível verificar a existência do objeto
-                                # antes de retornar uma preview_signed_url para evitar 404s no cliente.
-                                # Mantemos skip_exists_check=True para os arquivos principais,
-                                # mas para thumbnails/previews vamos fazer a verificação.
-                                tasks.append(asyncio.to_thread(
-                                    gerar_signed_url_conteudo, preview_gs, preview_fn,
-                                    expiration=7*24*60*60, skip_exists_check=False
-                                ))
+                            tasks.append(asyncio.to_thread(
+                                gerar_signed_url_conteudo, preview_gs, preview_fn,
+                                expiration=7*24*60*60, skip_exists_check=True
+                            ))
                             task_metadata.append((it, 'preview_signed_url', 'image_preview'))
-                    
+
                     # URL do GLB (TTL 7 dias)
                     glb_url = it.get('glb_url')
                     glb_filename = it.get('glb_filename')
@@ -1101,12 +1097,6 @@ async def attach_signed_urls_to_blocos_fast(blocos):
             elif b.get('meta') and isinstance(b['meta'].get('preview_filename'), str):
                 preview_fn = b['meta'].get('preview_filename')
 
-                # Não derivar preview a partir do filename no fast-path.
-                # Somente previews explícitos (preview_filename/thumb_filename/meta.preview_filename)
-                # serão considerados para anexar preview_signed_url.
-                if not preview_fn:
-                    preview_fn = None
-
             if preview_fn:
                 preview_gs = None
                 if url and isinstance(url, str) and url.startswith('gs://'):
@@ -1130,7 +1120,7 @@ async def attach_signed_urls_to_blocos_fast(blocos):
             glb_filename = b.get('glb_filename')
             if glb_url:
                 tasks.append(asyncio.to_thread(
-                    gerar_signed_url_conteudo, glb_url, glb_filename,
+                    gerar_signed_url_conteudo, glb_url, glb_filename, 
                     expiration=7*24*60*60, skip_exists_check=True
                 ))
                 task_metadata.append((b, 'glb_signed_url', 'glb'))
@@ -1426,6 +1416,7 @@ async def _search_and_compare_logic(file: UploadFile):
                             try:
                                 q_img = PILImage.open(q_img_path).convert('RGB')
                                 q_hash = imagehash.phash(q_img)
+
                                 candidate = top1.get('metadata', {})
                                 candidate_phash = candidate.get('phash')
                                 if candidate_phash:
@@ -1922,7 +1913,7 @@ async def get_images(ownerId: str = None):
                         skip_exists_check=True  # Logos sempre existem, não precisa verificar
                     )
                     if not signed:
-                        logging.warning(f"Could not generate signed_url for {url} (id={img.get('_id')})")
+                        logging.info(f"Could not generate signed_url for {url} (id={img.get('_id')})")
                 img['signed_url'] = signed
             except Exception as e:
                 logging.exception(f"Unexpected error while processing image for signed_url: {e}")
@@ -2427,6 +2418,22 @@ async def debug_inspect_request(data: dict = Body(...)):
     logging.info(f'[debug-inspect-request] Corpo recebido: {str(data)[:500]}')
     return {"received": data}
 
+@app.get('/debug/env')
+async def debug_env():
+    keys = [
+        "SEARCH_PREPROCESS_MODE",
+        "SEARCH_CROP_EXPAND_PCT",
+        "SEARCH_ACCEPTANCE_THRESHOLD",
+        "SEARCH_MIN_MARGIN",
+        "SEARCH_PHASH_OVERRIDE_SIM",
+        "SEARCH_EMBEDDING_WEIGHT",
+        "SEARCH_PHASH_WEIGHT",
+        "SEARCH_COMBINED_THRESHOLD",
+        "SEARCH_EMB_ONLY_THRESHOLD",
+        "SEARCH_ENABLE_PHASH"
+    ]
+    return {k: os.getenv(k) for k in keys}
+
 async def buscar_conteudo_por_marca_e_localizacao(marca_id, latitude, longitude, radius_m: float = None):
     """
     Procura um documento de conteúdo pela marca (preferencialmente por marca_id) e
@@ -2594,7 +2601,7 @@ async def api_reverse_geocode(lat: float = Query(...), lon: float = Query(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na geocodificação reversa: {str(e)}")
 
-# Cache em memória: {(nome_marca, latitude, longitude, radius): resultado}
+# Cache em memória: {(nome_marca, tipo_regiao, nome_regiao, radius): resultado}
 consulta_cache = {}
 CONSULTA_CACHE_MAX_SIZE = 1000
 
@@ -2605,9 +2612,9 @@ def add_to_consulta_cache(key, value):
         consulta_cache.pop(next(iter(consulta_cache)))
     consulta_cache[key] = value
 
-def make_cache_key(nome_marca, latitude, longitude):
+def make_cache_key(nome_marca, tipo_regiao, nome_regiao, radius):
     # Arredonda para evitar pequenas variações
-    return (nome_marca, round(latitude, 6), round(longitude, 6))
+    return (nome_marca, tipo_regiao, nome_regiao, round(radius) if radius is not None else None)
 
 @app.post('/consulta-conteudo/')
 async def consulta_conteudo(
@@ -2694,7 +2701,6 @@ async def consulta_conteudo(
 
     add_to_consulta_cache(cache_key, resultado)
     return resultado
-
 
 @app.post('/api/smart-content')
 async def smart_content_lookup(
@@ -3345,9 +3351,7 @@ async def post_conteudo(
                     b['filename'] = filename
                     if not b.get('url'):
                         b['url'] = f"gs://{GCS_BUCKET_CONTEUDO}/{filename}"
-            except Exception:
-                # keep going; post-processing must not fail the whole request
-                pass
+        
         if invalid_blocks:
             logging.warning('[post_conteudo] Rejeitando payload com blocos inválidos (blob:)', extra={'invalid_blocks': invalid_blocks, 'nome_marca': nome_marca, 'owner_uid': token.get('uid')})
             raise HTTPException(status_code=422, detail={ 'message': 'Payload contém referências locais (blob:). Faça upload das imagens primeiro.', 'invalid_blocks': invalid_blocks })
