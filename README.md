@@ -92,7 +92,7 @@ Crie arquivo `.env`:
 
 ```env
 # MongoDB Atlas
-MONGODB_URL=mongodb+srv://usuario:senha@cluster.mongodb.net/olinxplus
+MONGODB_URL=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/olinxplus
 
 # Reconhecimento Visual (Thresholds Otimizados - Dez 2025)
 SEARCH_COMBINED_THRESHOLD=0.50      # Combined CLIP+pHash threshold
