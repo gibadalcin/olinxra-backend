@@ -1,14 +1,17 @@
-# OlinxRA Backend
+# Olinx Plus Backend
 
 <div align="center">
 
-**API Backend para Plataforma de Realidade Aumentada**
+**API Backend para Plataforma de Realidade Aumentada com Reconhecimento Visual**
 
-[![FastAPI](https://img.shields.io/badge/FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115.6-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-47A248.svg?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-47A248.svg?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+[![Digital Ocean](https://img.shields.io/badge/Digital%20Ocean-Hosted-0080FF.svg?logo=digitalocean&logoColor=white)](https://www.digitalocean.com/)
 
-API REST de alta performance com reconhecimento visual de logos usando CLIP e FAISS
+API REST de alta performance com reconhecimento visual de logos usando CLIP (ONNX) e FAISS
+
+[Documentação](https://github.com/gibadalcin/olinxplus-docs) • [Admin UI](https://github.com/gibadalcin/olinxplus-adminui) • [Mobile App](https://github.com/gibadalcin/olinxplus)
 
 </div>
 
@@ -16,14 +19,15 @@ API REST de alta performance com reconhecimento visual de logos usando CLIP e FA
 
 ## 📋 Visão Geral
 
-O backend OlinxRA é uma API FastAPI que fornece:
+O backend Olinx Plus é uma API FastAPI hospedada no Digital Ocean que fornece:
 
-- 🔍 **Reconhecimento Visual**: Busca de logos por similaridade usando CLIP embeddings
-- 🗄️ **Gestão de Conteúdo**: CRUD completo para conteúdos AR e logos
-- 🎨 **Processamento de Mídia**: Upload e gerenciamento de imagens, vídeos e modelos 3D
-- 🔐 **Autenticação**: Integração com Firebase Authentication
-- ☁️ **Cloud Storage**: Google Cloud Storage para armazenamento de arquivos
-- 🤖 **IA**: CLIP (OpenAI) para embeddings visuais e FAISS para busca vetorial
+- 🔍 **Reconhecimento Visual Otimizado**: Busca de logos usando CLIP embeddings (ONNX) + pHash híbrido
+- 🗄️ **Gestão de Conteúdo**: CRUD completo para conteúdos AR, logos e marcas
+- 🎨 **Processamento de Mídia**: Upload, geração automática de GLBs e signed URLs
+- 🔐 **Autenticação**: Firebase Authentication para AdminUI (app mobile é público)
+- ☁️ **Cloud Storage**: Google Cloud Storage (buckets: olinxra-conteudo, olinxra-logos)
+- 🤖 **IA**: CLIP ONNX (512d embeddings) + FAISS IVF para busca sublinear
+- ⚡ **Performance**: Thresholds calibrados, crop inteligente, cache otimizado
 
 ## 🚀 Quick Start
 
@@ -37,9 +41,10 @@ O backend OlinxRA é uma API FastAPI que fornece:
 
 ### Instalação
 
-1. **Clone e navegue até o diretório**
+1. **Clone o repositório**
 ```bash
-cd olinxra-backend
+git clone https://github.com/gibadalcin/olinxplus-backend.git
+cd olinxplus-backend
 ```
 
 2. **Crie um ambiente virtual**
@@ -54,49 +59,68 @@ venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 ```
 
-4. **Configure as variáveis de ambiente**
-```bash
-cp .env.example .env
+4. **Configure as credenciais**
+
+Coloque os seguintes arquivos no diretório raiz (não commitáveis):
+
+**`firebase-cred.json`** - Firebase Admin SDK
+```json
+{
+  "type": "service_account",
+  "project_id": "seu-projeto",
+  "private_key_id": "...",
+  "private_key": "-----BEGIN PRIVATE KEY-----\n...",
+  "client_email": "firebase-adminsdk@...",
+  ...
+}
 ```
 
-Edite o arquivo `.env` com suas credenciais:
+**`cloud-storage-cred.json`** - Google Cloud Storage
+```json
+{
+  "type": "service_account",
+  "project_id": "seu-projeto-gcs",
+  "private_key_id": "...",
+  "private_key": "-----BEGIN PRIVATE KEY-----\n...",
+  ...
+}
+```
+
+5. **Configure variáveis de ambiente**
+
+Crie arquivo `.env`:
 
 ```env
-# MongoDB
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB=olinxra
+# MongoDB Atlas
+MONGODB_URL=mongodb+srv://usuario:senha@cluster.mongodb.net/olinxplus
 
-# Firebase
-FIREBASE_PROJECT_ID=seu-projeto-firebase
-FIREBASE_PRIVATE_KEY_ID=...
-FIREBASE_PRIVATE_KEY=...
-FIREBASE_CLIENT_EMAIL=...
+# Reconhecimento Visual (Thresholds Otimizados - Dez 2025)
+SEARCH_COMBINED_THRESHOLD=0.50      # Combined CLIP+pHash threshold
+SEARCH_MIN_MARGIN=0.01              # Mínimo entre top-1 e top-2
+SEARCH_ACCEPTANCE_THRESHOLD=0.72    # Alta confiança
+SEARCH_PHASH_WEIGHT=0.20            # Peso pHash (estrutural)
+SEARCH_EMBEDDING_WEIGHT=0.80        # Peso CLIP (semântico)
+SEARCH_CENTER_CROP_RATIO=1.0        # Crop desabilitado (app faz crop)
+SEARCH_CROP_EXPAND_PCT=0            # Sem expansão
 
 # Google Cloud Storage
-GCS_BUCKET_NAME=olinxra-conteudo
-GCS_PROJECT_ID=seu-projeto-gcp
-
-# JWT (opcional para autenticação adicional)
-JWT_SECRET_KEY=sua-chave-secreta-aleatoria
-JWT_ALGORITHM=HS256
+GCS_BUCKET_CONTEUDO=olinxra-conteudo
+GCS_BUCKET_LOGOS=olinxra-logos
 ```
-
-5. **Adicione os arquivos de credenciais**
-
-Coloque os seguintes arquivos no diretório (não commitáveis):
-- `firebase-cred.json` - Credenciais do Firebase Admin SDK
-- `cloud-storage-cred.json` - Credenciais do Google Cloud Storage
 
 6. **Execute o servidor**
 ```bash
 # Desenvolvimento
+python main.py
+# ou
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-# Produção
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+# Produção (Digital Ocean)
+uvicorn main:app --host 0.0.0.0 --port 8080 --workers 4
 ```
 
-A API estará disponível em `http://localhost:8000`
+A API estará disponível em `http://localhost:8000`  
+Documentação interativa: `http://localhost:8000/docs`
 
 ## 📡 Endpoints Principais
 
@@ -153,26 +177,34 @@ GET    /debug/conteudos        # Listar todos os conteúdos
 ## 🏗️ Arquitetura
 
 ```
-olinxra-backend/
-├── main.py                    # Entrypoint FastAPI
+olinxplus-backend/
+├── main.py                    # Entrypoint FastAPI (4146 linhas)
 ├── schemas.py                 # Modelos Pydantic
 ├── firebase_utils.py          # Firebase Admin + Auth
 ├── gcs_utils.py               # Google Cloud Storage
-├── clip_utils.py              # CLIP embeddings
-├── faiss_index.py             # Busca vetorial FAISS
-├── glb_generator.py           # Processamento de GLB
+├── clip_utils.py              # CLIP embeddings (ONNX)
+├── faiss_index.py             # Busca vetorial FAISS IVF
+├── glb_generator.py           # Geração automática de GLB
 ├── requirements.txt           # Dependências Python
+├── .env                       # Variáveis de ambiente (não commitável)
 │
-├── clip_image_encoder.onnx    # Modelo CLIP (ONNX)
+├── firebase-cred.json         # Firebase Admin SDK (não commitável)
+├── cloud-storage-cred.json    # GCS credentials (não commitável)
+│
+├── clip_image_encoder.onnx    # Modelo CLIP (512d embeddings)
 ├── quantized_clip_model.onnx  # Modelo CLIP quantizado
-├── faiss_index.index          # Índice FAISS (gerado)
-├── logo_metadata.pkl          # Metadados dos logos
+├── faiss_index.index          # Índice FAISS (gerado dinamicamente)
+├── logo_metadata.pkl          # Metadados dos logos indexados
+│
+├── docs/                      # Documentação técnica
+│   └── CROP-OPTIMIZATION.md   # Otimizações de reconhecimento
 │
 ├── tools/                     # Scripts utilitários
 │   ├── add_topo_glb.py
 │   ├── check_glbs_now.py
-│   ├── migrate_conteudos.py
-│   └── ...
+│   ├── generate_glbs_from_existing_images.py
+│   ├── preprocess_variants.py
+│   └── delete_anonymous_users.py
 │
 └── docs/                      # Documentação específica
 ```
@@ -389,22 +421,22 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 ```bash
-docker build -t olinxra-backend .
-docker run -p 8000:8000 --env-file .env olinxra-backend
+docker build -t olinxplus-backend .
+docker run -p 8000:8000 --env-file .env olinxplus-backend
 ```
 
 ### Systemd (VM/VPS)
 
 ```ini
 [Unit]
-Description=OlinxRA Backend API
+Description=Olinx Plus Backend API
 After=network.target
 
 [Service]
-User=olinxra
-WorkingDirectory=/home/olinxra/olinxra-backend
-Environment="PATH=/home/olinxra/venv/bin"
-ExecStart=/home/olinxra/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+User=olinxplus
+WorkingDirectory=/home/olinxplus/olinxplus-backend
+Environment="PATH=/home/olinxplus/venv/bin"
+ExecStart=/home/olinxplus/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=always
 
 [Install]
@@ -436,5 +468,5 @@ Este projeto está sob a licença MIT.
 ---
 
 <div align="center">
-<strong>Backend OlinxRA</strong> | Construído com FastAPI e ❤️
+<strong>Olinx Plus Backend</strong> | Construído com FastAPI e ❤️
 </div>
